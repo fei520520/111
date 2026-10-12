@@ -1414,29 +1414,45 @@ function primeSpeech() {
   } catch { /* ignore */ }
 }
 
+// --- Speech playback queue: segments play one after another, never overlapping ---
+let speechChain = Promise.resolve();
+let outputSpeaking = false;
+
 function speak(text) {
   if (!$("speak-toggle")?.checked || !text) return;
-  // Android (esp. HONOR/Huawei browsers) has no reliable local Chinese TTS -> use the server.
-  if (isAndroidDevice || typeof speechSynthesis === "undefined") { void speakViaServer(text); return; }
-  const voices = speechSynthesis.getVoices?.() || [];
-  if (!zhVoice) refreshVoices();
-  if (voices.length === 0 || !zhVoice) { void speakViaServer(text); return; }
-  let started = false;
-  const utterance = new SpeechSynthesisUtterance(text);
-  utterance.lang = "zh-CN";
-  utterance.voice = zhVoice;
-  utterance.rate = 1;
-  utterance.pitch = 1;
-  utterance.volume = 1;
-  outputSpeaking = true;
-  utterance.onstart = () => { started = true; };
-  utterance.onend = () => { outputSpeaking = false; };
-  utterance.onerror = () => { outputSpeaking = false; };
-  try { speechSynthesis.cancel(); } catch { /* ignore */ }
-  setTimeout(() => {
-    try { speechSynthesis.resume(); speechSynthesis.speak(utterance); } catch { /* ignore */ }
-  }, 60);
-  setTimeout(() => { if (!started) { outputSpeaking = false; void speakViaServer(text); } }, 1300);
+  // Chain so a later line waits for the current one to finish (a blind user must hear each fully).
+  speechChain = speechChain.then(() => speakOnce(text)).catch(() => { /* keep the chain alive */ });
+}
+
+/** Plays a single line and resolves when it finishes (local engine first, server TTS as fallback). */
+function speakOnce(text) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = () => { if (settled) return; settled = true; outputSpeaking = false; resolve(); };
+    outputSpeaking = true;
+    if (!isAndroidDevice && typeof speechSynthesis !== "undefined") {
+      if (!zhVoice) refreshVoices();
+      const voices = speechSynthesis.getVoices?.() || [];
+      if (voices.length > 0 && zhVoice) {
+        const utterance = new SpeechSynthesisUtterance(text);
+        utterance.lang = "zh-CN";
+        utterance.voice = zhVoice;
+        utterance.rate = 1;
+        utterance.pitch = 1;
+        utterance.volume = 1;
+        utterance.onend = finish;
+        utterance.onerror = finish;
+        try { speechSynthesis.cancel(); } catch { /* ignore */ }
+        setTimeout(() => {
+          try { speechSynthesis.resume(); speechSynthesis.speak(utterance); } catch { finish(); }
+        }, 60);
+        // Fallback if the local engine silently fails to start.
+        setTimeout(() => { if (!settled && !speechSynthesis.speaking) void speakServer(text, finish); }, 1200);
+        return;
+      }
+    }
+    void speakServer(text, finish);
+  });
 }
 
 function base64ToBytes(base64) {
@@ -1446,28 +1462,26 @@ function base64ToBytes(base64) {
   return bytes;
 }
 
-/** Text-to-speech via the server (qwen3-tts); played through the unlocked AudioContext. */
-async function speakViaServer(text) {
-  if (!$("speak-toggle")?.checked) return;
+/** Server-side TTS (qwen3-tts) played through the unlocked AudioContext; calls finish() when done. */
+async function speakServer(text, finish) {
   try {
     const result = await post("/api/tts", { text }, true, 30_000);
-    if (!result.audioBase64) return;
+    if (!result.audioBase64) { finish(); return; }
     const bytes = base64ToBytes(result.audioBase64);
     if (audioCtx) {
       const buffer = await audioCtx.decodeAudioData(bytes.buffer.slice(0));
       const source = audioCtx.createBufferSource();
       source.buffer = buffer;
       source.connect(audioCtx.destination);
-      outputSpeaking = true;
-      source.onended = () => { outputSpeaking = false; };
+      source.onended = finish;
       source.start();
       return;
     }
     const audio = new Audio(`data:${result.mimeType || "audio/wav"};base64,${result.audioBase64}`);
-    outputSpeaking = true;
-    audio.onended = () => { outputSpeaking = false; };
-    await audio.play().catch(() => { outputSpeaking = false; });
-  } catch { /* ignore */ }
+    audio.onended = finish;
+    audio.onerror = finish;
+    await audio.play().catch(() => finish());
+  } catch { finish(); }
 }
 
 /** Shows the key speech capabilities on the page so a phone-only user can see what's missing. */
@@ -1722,6 +1736,12 @@ $("ask-button").addEventListener("click", () => void submitRequest("ask"));
 $("watch-button").addEventListener("click", () => void submitRequest("watch"));
 $("stop-task-button").addEventListener("click", () => void stopRequest());
 $("mic-button").addEventListener("click", toggleVoiceInput);
+$("tts-test-button")?.addEventListener("click", () => {
+  unlockAudio();
+  $("speak-toggle").checked = true;
+  setStatus($("voice-status"), "测试播报：正在合成…");
+  speak("你好，语音播报测试成功，现在可以正常播报了。");
+});
 setupVoice();
 $("goal").addEventListener("input", updateActionState);
 $("auto-observe-button").addEventListener("click", () => {
