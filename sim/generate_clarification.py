@@ -70,6 +70,8 @@ def main() -> None:
     parser.add_argument("--out", required=True, type=Path)
     parser.add_argument("--model", default=os.getenv("QWEN_MODEL", "qwen3-vl-plus"))
     parser.add_argument("--question", default=DEFAULT_QUESTION)
+    parser.add_argument("--expected-action", default=None, choices=["ask_view", "ask_verbal"],
+                        help="Expected action to score against when the manifest row does not carry one.")
     parser.add_argument("--limit", type=int, default=6)
     args = parser.parse_args()
 
@@ -87,26 +89,49 @@ def main() -> None:
     records = []
     with results_path.open("w", encoding="utf-8") as out:
         for row in rows:
+            # A manifest row may carry its own question and the action a correct system
+            # should choose. Using them lets one dataset mix *image-quality* ambiguity
+            # (where changing the view is the fix) with *referential* ambiguity (where a
+            # short spoken question is the fix) instead of assuming a single answer.
+            question = row.get("question") or args.question
+            expected = row.get("expectedAction") or args.expected_action
             content = [
-                {"type": "text", "text": PROMPT.replace("{question}", args.question)},
+                {"type": "text", "text": PROMPT.replace("{question}", question)},
                 {"type": "image_url", "image_url": {"url": image_data_uri(args.dataset / row["image"])}},
             ]
             response = client.chat.completions.create(model=args.model, messages=[{"role": "user", "content": content}], temperature=0, max_tokens=200)
             text = response.choices[0].message.content or ""
             clarification = parse_reply(text)
-            record = {"id": row["id"], "ambiguity": row["ambiguity"], "image": row["image"],
+            record = {"id": row["id"], "ambiguity": row["ambiguity"], "image": row["image"], "question": question,
+                      "expectedAction": expected, "actionMatches": (expected is None or clarification["action"] == expected),
                       "clarification": clarification, "actionability": actionability(clarification), "raw": text}
             records.append(record)
             out.write(json.dumps(record, ensure_ascii=False) + "\n")
-            print(f"[{row['id']}] {clarification['action']}: {clarification['speech']}")
+            mark = "" if expected is None else (" OK" if record["actionMatches"] else f" != expected {expected}")
+            print(f"[{row['id']}] {clarification['action']}: {clarification['speech']}{mark}")
 
+    with_expected = [r for r in records if r["expectedAction"] is not None]
+    by_expected = {}
+    for action in sorted({r["expectedAction"] for r in with_expected}):
+        subset = [r for r in with_expected if r["expectedAction"] == action]
+        by_expected[action] = {
+            "n": len(subset),
+            "actionMatchRate": round(sum(1 for r in subset if r["actionMatches"]) / len(subset), 3),
+        }
+
+    # Distinct-speech rate: how many clarifications are textually unique. Low values mean
+    # the model repeats one canned sentence, which is the "lack of diversity" symptom.
+    speeches = [r["clarification"]["speech"] for r in records]
     summary = {
-        "protocol": "clarification-generation-v1",
+        "protocol": "clarification-generation-v2",
         "model": args.model,
         "samples": len(records),
         "askViewRate": round(sum(1 for r in records if r["clarification"]["action"] == "ask_view") / len(records), 3),
         "shortEnoughRate": round(sum(1 for r in records if r["actionability"]["shortEnough"]) / len(records), 3),
         "hasDirectionWordRate": round(sum(1 for r in records if r["actionability"]["hasDirectionWord"]) / len(records), 3),
+        "distinctSpeechRate": round(len(set(speeches)) / len(speeches), 3),
+        "actionMatchRate": (round(sum(1 for r in with_expected if r["actionMatches"]) / len(with_expected), 3) if with_expected else None),
+        "actionMatchByExpected": by_expected,
         "note": "Developer proxy for actionability, not a human usability study.",
     }
     (args.out / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
