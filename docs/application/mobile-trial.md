@@ -28,7 +28,7 @@ powershell -ExecutionPolicy Bypass -File scripts/setup-lan-tls.ps1
 ## 2. 启动服务
 
 ```powershell
-$env:VLM_TRIAL_PASSCODE = "hjl"      # 至少 3 位的临时口令
+$env:VLM_TRIAL_PASSCODE = "zpf"      # 至少 3 位的临时口令
 npm.cmd run trial:web
 ```
 
