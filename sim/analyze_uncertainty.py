@@ -68,6 +68,39 @@ def roc_auc(scores: list[float], labels: list[int]) -> float | None:
 SIGNALS = ["model_confidence", "sharpness", "brightness", "contrast", "dark_ratio"]
 
 
+def rank_normalize(values: list[float]) -> list[float]:
+    """Map values to [0,1] by rank, so signals with different units can be fused."""
+    n = len(values)
+    if n <= 1:
+        return [0.0] * n
+    order = sorted(range(n), key=lambda i: values[i])
+    out = [0.0] * n
+    for rank, index in enumerate(order):
+        out[index] = rank / (n - 1)
+    return out
+
+
+def fuse(rows: list[dict]) -> list[float]:
+    """A simple equal-weight fusion of the two strongest signals (confidence + sharpness)."""
+    conf = rank_normalize([r["model_confidence"] for r in rows])
+    sharp = rank_normalize([r["sharpness"] for r in rows])
+    return [(c + s) / 2 for c, s in zip(conf, sharp)]
+
+
+def risk_coverage(scores: list[float], labels: list[int], steps: int = 10) -> list[dict]:
+    """Sort by score (high = more trustworthy); report error rate as we accept more samples."""
+    pairs = sorted(zip(scores, labels), key=lambda item: -item[0])
+    n = len(pairs)
+    if n == 0:
+        return []
+    curve = []
+    for step in range(1, steps + 1):
+        k = max(1, int(n * step / steps))
+        error = 1 - sum(label for _, label in pairs[:k]) / k
+        curve.append({"coverage": round(step / steps, 1), "error": round(error, 3)})
+    return curve
+
+
 def summarize(rows: list[dict]) -> dict:
     labels = [1 if r["correct"] else 0 for r in rows]
     out = {}
@@ -110,13 +143,24 @@ def main() -> None:
     for row in rows:
         by_kind[row["ambiguity"]].append(row)
 
+    fused = fuse(rows)
+    for row, score in zip(rows, fused):
+        row["fused"] = score
+    labels = [1 if r["correct"] else 0 for r in rows]
+
     report = {
         "protocol": "uncertainty-signals-v1",
         "samples": len(rows),
         "correctSimilarityThreshold": CORRECT_SIMILARITY,
         "overallAccuracy": round(sum(1 for r in rows if r["correct"]) / len(rows), 3),
-        "overall": summarize(rows),
+        "overall": {**summarize(rows), "fused": {"auc": roc_auc(fused, labels)}},
         "byAmbiguity": {kind: {"n": len(items), **summarize(items)} for kind, items in sorted(by_kind.items())},
+        "triggerComparison": {
+            "note": "Which signal should decide to clarify? Higher AUC = better at telling correct from wrong.",
+            "byModelConfidence": risk_coverage([r["model_confidence"] for r in rows], labels),
+            "bySharpness": risk_coverage([r["sharpness"] for r in rows], labels),
+            "byFused": risk_coverage(fused, labels),
+        },
         "note": "AUC ~0.5 means the signal cannot separate correct from wrong answers. Cheap image features are a developer proxy, not validated reliability.",
     }
     for kind, stats in report["byAmbiguity"].items():
