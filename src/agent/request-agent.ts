@@ -125,6 +125,11 @@ export class RequestAgent {
 	private state: RequestState = {
 		mode: null, kind: null, text: null, status: "idle", spoken: false, lastAnswer: null, turns: [], startedAtMs: null, updatedAtMs: null,
 	};
+	/**
+	 * Conversation so far (question + answer per turn). Kept across requests so a follow-up
+	 * like "is this it?" still knows the earlier goal ("find the guitar bag").
+	 */
+	private history: Array<{ question: string; answer: string }> = [];
 
 	constructor(private readonly getSceneMemory: SceneMemoryProvider | null = null) {
 		const configured = createQwenModel(512);
@@ -200,8 +205,10 @@ export class RequestAgent {
 		})));
 
 		const recent = this.state.turns.slice(-3).map((turn) => ({ kind: turn.kind, answer: turn.answer, spoke: turn.shouldSpeak }));
+		const historyText = this.history.slice(-4).map((turn) => `the user asked: ${turn.question}\nyou answered: ${turn.answer}`).join("\n");
 		const promptLines = [
 			"Answer the user's requirement using the current frames. Image blocks are in chronological order.",
+			`CONVERSATION SO FAR (earlier turns; the user may be following up on these — e.g. "is this it?" refers to the item they were previously looking for):\n${historyText || "(none)"}`,
 			`MODE: ${this.state.mode ?? "ask"}`,
 			`REQUIREMENT: ${this.state.text}`,
 			`SCENE: ${sceneLabel ?? "unknown"}`,
@@ -230,6 +237,12 @@ export class RequestAgent {
 		this.state.turns.push(turn);
 		if (done) this.state.status = "done";
 		this.state.updatedAtMs = Date.now();
+		// Remember this turn so the next request keeps context (follow-ups, "is this it?").
+		const question = this.state.text ?? "";
+		const previous = this.history[this.history.length - 1];
+		if (previous && previous.question === question) previous.answer = parsed.answer;
+		else this.history.push({ question, answer: parsed.answer });
+		if (this.history.length > 6) this.history = this.history.slice(-6);
 
 		return { ...parsed, shouldSpeak, done, frameIds: [ordered[ordered.length - 1]!.id], raw };
 	}
