@@ -2,7 +2,7 @@ const $ = (id) => document.getElementById(id);
 const FRAME_BUFFER_MAX = 32;
 const MONITOR_MAX_WINDOW_MS = 30_000;
 const MONITOR_MAX_FRAMES = 8;
-const AWARENESS_RECHECK_INTERVAL_MS = 10_000;
+const AWARENESS_RECHECK_INTERVAL_MS = 5_000;
 const CAPTURE_INTERVAL_MS = 1_000;
 /** Unconditional background save cadence while the camera is on. */
 const LIVE_SYNC_INTERVAL_MS = 5_000;
@@ -15,9 +15,23 @@ const ROUTER_SIGNATURE_WIDTH = 32;
 const ROUTER_SIGNATURE_HEIGHT = 24;
 const ROUTER_STABLE_DELTA = 0.04;
 const ROUTER_VISUAL_NOVELTY_DELTA = 0.10;
-/** Automatic observations are rate-limited to at most one per 10 s. */
-const ROUTER_MIN_INTERVAL_MS = 10_000;
-const ROUTER_COOLDOWN_MS = 10_000;
+/**
+ * Automatic observations are rate-limited so the assistant keeps up with a user who is WALKING.
+ * The old 10s window meant a blind user could cover 15+ metres before the scene was re-read, so
+ * the answer described a place they had already left. 3.5s trades API cost for freshness; raise
+ * these back toward 10s if the request volume matters more than latency.
+ */
+const ROUTER_MIN_INTERVAL_MS = 3_500;
+const ROUTER_COOLDOWN_MS = 3_500;
+
+/**
+ * Cost control for the "find my thing" loop. A VLM call is only worth making when the view has
+ * actually changed since the last answer: a user staring at the same scene cannot receive a new
+ * answer, so that call would be spent for nothing. Raising REQUEST_CHANGE_DELTA saves more calls
+ * and lowers sensitivity; lowering it makes the assistant react to smaller changes.
+ */
+const REQUEST_CHANGE_DELTA = 0.06;
+const REQUEST_IDLE_MAX_MS = 20_000;
 /** The phone must have travelled this cumulative path in the window to count as an action. */
 const ACTION_PATH_M = 1.5;
 /** Net heading change (with coherence) required to count as a turn. */
@@ -618,7 +632,11 @@ function updateDiagnostics() {
   const orientation = state.motion.listenerActive
     ? `${permissionLabel(state.motion.orientationPermission)}（${state.motion.orientations.length}）`
     : permissionLabel(state.motion.orientationPermission);
-  el.textContent = `摄像头：${camera}\n运动传感器：${motion}\n姿态传感器：${orientation}\n截图缓冲：${state.frames.length} 帧 · VIO 特征：${state.vio.features.length}`;
+  // Model-call counters make the cost of a strategy visible: the point of change-driven checking
+  // is that skipped checks (free) should far outnumber actual calls (paid).
+  const calls = state.router.stats.requestCalls || 0;
+  const skipped = state.router.stats.requestChecksSkipped || 0;
+  el.textContent = `摄像头：${camera}\n运动传感器：${motion}\n姿态传感器：${orientation}\n截图缓冲：${state.frames.length} 帧 · VIO 特征：${state.vio.features.length}\n找东西：模型调用 ${calls} 次 · 省下 ${skipped} 次（${calls + skipped > 0 ? Math.round(skipped / (calls + skipped) * 100) : 0}% 未调用）`;
 }
 
 function renderFrames() {
@@ -840,7 +858,7 @@ function startVio() {
   state.vio.prevAbsHeading = null;
   state.vio.lastPlaceMs = 0;
   state.vio.timer = window.setInterval(vioTick, VIO_INTERVAL_MS);
-  state.vio.placeTimer = window.setInterval(() => { void maybeObserveScene(); void maybeObserveSceneChange(); void stepRequest(); updateDiagnostics(); }, 5_000);
+  state.vio.placeTimer = window.setInterval(() => { void maybeObserveScene(); void maybeObserveSceneChange(); void stepRequest(); updateDiagnostics(); }, 2_500);
 }
 
 function stopVio() {
@@ -1369,7 +1387,7 @@ async function stopCurrentTask() {
 const isAndroidDevice = /Android|HarmonyOS|Huawei|HONOR/i.test(navigator.userAgent || "");
 let voiceAssistantOn = false;
 let outputSpeaking = false;   // true while playing audio, so the VAD ignores our own voice
-const vad = { stream: null, ctx: null, analyser: null, timer: null, buffer: null, speaking: false, silenceSince: 0, startedAt: 0, recorder: null, chunks: [] };
+const vad = { stream: null, ctx: null, analyser: null, timer: null, buffer: null, speaking: false, silenceSince: 0, startedAt: 0, recorder: null, chunks: [], bargeStreak: 0 };
 
 // --- Speech synthesis (voice output) ---
 // Mobile quirks handled: getVoices() loads late; the engine can get stuck "paused";
@@ -1417,10 +1435,32 @@ function primeSpeech() {
 // --- Speech playback queue: segments play one after another, never overlapping ---
 let speechChain = Promise.resolve();
 let speechCooldownUntil = 0;   // brief pause after speaking so we don't record our own audio
+// Barge-in: a blind user walking must be able to talk over the assistant instead of waiting for it
+// to finish. We keep listening while speaking and stop as soon as the user clearly takes a turn.
+let speechStartedAt = 0;
+let currentPlayback = null;    // { stop(): void } for whatever audio is playing right now
+// Voice playback speed. Above 1 the assistant speaks faster AND at a higher pitch, which is what
+// turns a flat read-out into something bright and sweet. Tune these two if it does not sound right.
+const SPEECH_RATE = 1.25;
+const SPEECH_PITCH = 1.3;
 
-function speak(text) {
+// How important a spoken line is. A blind user needs the *current* answer more than a complete
+// reading of an outdated one, so a newer line is allowed to cut off the one already playing.
+const SPEECH_LOW = 0;      // background narration; dropped silently if something newer is playing
+const SPEECH_NORMAL = 1;   // status messages and replies
+const SPEECH_URGENT = 2;   // the answer to what the user is actively looking for
+
+function speak(text, priority = SPEECH_NORMAL) {
   if (!$("speak-toggle")?.checked || !text) return;
-  // Chain so a later line waits for the current one to finish (a blind user must hear each fully).
+  if (outputSpeaking) {
+    if (priority >= SPEECH_NORMAL) {
+      // Interrupt ourselves: the new line matters more than finishing the old one.
+      stopSpeaking();
+      speechChain = Promise.resolve();   // and drop anything still queued behind it
+    } else {
+      return;   // a stale, low-priority line is worse than saying nothing at all
+    }
+  }
   speechChain = speechChain.then(() => speakOnce(text)).catch(() => { /* keep the chain alive */ });
 }
 
@@ -1428,8 +1468,9 @@ function speak(text) {
 function speakOnce(text) {
   return new Promise((resolve) => {
     let settled = false;
-    const finish = () => { if (settled) return; settled = true; outputSpeaking = false; speechCooldownUntil = Date.now() + 900; resolve(); };
+    const finish = () => { if (settled) return; settled = true; outputSpeaking = false; currentPlayback = null; speechCooldownUntil = Date.now() + 900; resolve(); };
     outputSpeaking = true;
+    speechStartedAt = Date.now();
     if (!isAndroidDevice && typeof speechSynthesis !== "undefined") {
       if (!zhVoice) refreshVoices();
       const voices = speechSynthesis.getVoices?.() || [];
@@ -1437,8 +1478,8 @@ function speakOnce(text) {
         const utterance = new SpeechSynthesisUtterance(text);
         utterance.lang = "zh-CN";
         utterance.voice = zhVoice;
-        utterance.rate = 1;
-        utterance.pitch = 1;
+        utterance.rate = SPEECH_RATE;
+        utterance.pitch = SPEECH_PITCH;
         utterance.volume = 1;
         utterance.onend = finish;
         utterance.onerror = finish;
@@ -1472,14 +1513,22 @@ async function speakServer(text, finish) {
       const buffer = await audioCtx.decodeAudioData(bytes.buffer.slice(0));
       const source = audioCtx.createBufferSource();
       source.buffer = buffer;
+      source.playbackRate.value = SPEECH_RATE;   // faster and brighter at the same time
       source.connect(audioCtx.destination);
       source.onended = finish;
+      currentPlayback = { stop: () => { try { source.stop(); } catch { /* already stopped */ } } };
       source.start();
       return;
     }
     const audio = new Audio(`data:${result.mimeType || "audio/wav"};base64,${result.audioBase64}`);
+    // By default the browser keeps the original pitch while speeding up, which would throw away the
+    // brighter tone we get from Web Audio playback, so turn pitch preservation off here too.
+    audio.preservesPitch = false;
+    if ("webkitPreservesPitch" in audio) audio.webkitPreservesPitch = false;
+    audio.playbackRate = SPEECH_RATE;
     audio.onended = finish;
     audio.onerror = finish;
+    currentPlayback = { stop: () => { try { audio.pause(); } catch { /* ignore */ } } };
     await audio.play().catch(() => finish());
   } catch { finish(); }
 }
@@ -1513,6 +1562,32 @@ const VAD_THRESHOLD = 0.045;   // RMS above this counts as speech
 const VAD_SILENCE_MS = 1400;   // this much silence ends an utterance
 const VAD_MAX_MS = 15000;      // hard cap on a single utterance
 
+// --- Barge-in thresholds ---
+// Our own speech reaches the microphone too, so interrupting uses a *higher* bar than normal
+// speech detection and requires it to be sustained, rather than firing on a single loud tick.
+const BARGE_IN_THRESHOLD = 0.10;   // > VAD_THRESHOLD: our own TTS leaking into the mic stays below this
+const BARGE_IN_STREAK = 4;         // consecutive loud ticks (4 x 90ms ~ 360ms) before we yield
+const BARGE_IN_GRACE_MS = 350;     // ignore the very start of our own playback
+
+/** Stops whatever is being said right now (local engine and server audio alike). */
+function stopSpeaking() {
+  try { speechSynthesis?.cancel(); } catch { /* ignore */ }
+  try { currentPlayback?.stop(); } catch { /* ignore */ }
+  currentPlayback = null;
+  outputSpeaking = false;   // we are no longer producing sound
+}
+
+/** The user is talking over us: drop the queue and take their turn immediately. */
+function interruptSpeech() {
+  vad.bargeStreak = 0;
+  outputSpeaking = false;
+  speechCooldownUntil = 0;
+  stopSpeaking();
+  speechChain = Promise.resolve();   // discard lines that had not started yet
+  setStatus($("voice-status"), "已听到你说话，正在听…");
+  if (!vad.speaking) { vad.speaking = true; vad.startedAt = Date.now(); startSegment(); }
+}
+
 async function startVoiceAssistant() {
   if (voiceAssistantOn) return;
   if (typeof MediaRecorder === "undefined" || !navigator.mediaDevices?.getUserMedia) {
@@ -1520,7 +1595,15 @@ async function startVoiceAssistant() {
     return;
   }
   try {
-    vad.stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    vad.stream = await navigator.mediaDevices.getUserMedia({
+      audio: {
+        // Echo cancellation keeps our own spoken replies out of the recording, which is what
+        // makes talking over the assistant possible without transcribing ourselves.
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true,
+      },
+    });
   } catch (error) {
     setStatus($("voice-status"), `无法访问麦克风：${error.message}（需信任证书并允许麦克风）`, true);
     return;
@@ -1561,10 +1644,22 @@ function vadVolume() {
 }
 
 function vadTick() {
-  // Ignore our own audio output and any in-flight analysis so we don't transcribe the reply.
-  if (!voiceAssistantOn || state.busy || outputSpeaking || Date.now() < speechCooldownUntil) return;
+  if (!voiceAssistantOn || state.busy) return;
   const volume = vadVolume();
   const now = Date.now();
+
+  // While we are speaking we KEEP listening. A loud, sustained signal means the user is talking
+  // over us, so we stop immediately and give them the floor instead of making them wait.
+  if (outputSpeaking) {
+    if (now - speechStartedAt > BARGE_IN_GRACE_MS && volume > BARGE_IN_THRESHOLD) {
+      vad.bargeStreak = (vad.bargeStreak || 0) + 1;
+      if (vad.bargeStreak >= BARGE_IN_STREAK) interruptSpeech();
+    } else {
+      vad.bargeStreak = 0;
+    }
+    return;
+  }
+  if (now < speechCooldownUntil) return;
   if (volume > VAD_THRESHOLD) {
     vad.silenceSince = 0;
     if (!vad.speaking) { vad.speaking = true; vad.startedAt = now; startSegment(); }
@@ -1676,11 +1771,25 @@ function encodeWavBase64(samples, sampleRate) {
   return btoa(binary);
 }
 
+/** Waits for an in-flight analysis to end, so a user question is never simply refused. */
+function waitUntilIdle(timeoutMs) {
+  return new Promise((resolve) => {
+    const started = Date.now();
+    const check = () => {
+      if (!state.busy || Date.now() - started > timeoutMs) resolve();
+      else window.setTimeout(check, 120);
+    };
+    check();
+  });
+}
+
 /** Role 3: the user's explicit requirement. */
 async function submitRequest(mode) {
   const text = $("goal").value.trim();
   if (!text) { setStatus($("app-status"), "请先填写要求或关注条件。"); return; }
-  if (state.busy) { setStatus($("app-status"), "当前还有分析在进行，稍后再试。"); return; }
+  // What the user asks for outranks the automatic tracker, so wait a moment for it to yield
+  // instead of turning them away with "还有分析在进行".
+  if (state.busy) { setStatus($("app-status"), "正在结束上一轮分析…"); await waitUntilIdle(4_000); }
   primeSpeech();
   state.busy = true;
   try {
@@ -1688,11 +1797,14 @@ async function submitRequest(mode) {
     const result = await post("/api/request", {
       action: mode === "watch" ? "watch" : "ask",
       text,
-      frames: framesForUpload(2, 8_000),
+      // A narrow window keeps the model looking at what is in front of the user NOW, rather
+      // than at where they were eight seconds ago.
+      frames: framesForUpload(2, 3_500),
       ...(motion ? { motionDescription: motion } : {}),
       ...(state.sceneLabel ? { sceneLabel: state.sceneLabel } : {}),
     });
-    state.request = { ...state.request, ...result.request, lastStepMs: Date.now() };
+    const anchor = state.frames.at(-1);
+    state.request = { ...state.request, ...result.request, lastStepMs: Date.now(), ...(anchor ? { lastStepSignature: anchor.signature } : {}) };
     if (result.result) showRequestResult(result.result);
     else setStatus($("app-status"), `已设定要求：${text}`);
   } catch (error) {
@@ -1704,14 +1816,29 @@ async function stepRequest() {
   if (state.busy || state.request.status !== "active") return;
   if (!state.stream || !state.frames.length) return;
   const now = Date.now();
-  if (now - (state.request.lastStepMs || 0) < 8_000) return;
+  const idleFor = now - (state.request.lastStepMs || 0);
+  // Cost control. Asking the model again while the view is unchanged cannot produce a different
+  // answer, so that call would be spent for nothing. Change is what buys a new observation:
+  // a user sweeping the camera generates change (and gets prompt answers), while a user standing
+  // still costs nothing. REQUEST_IDLE_MAX_MS is only a floor so a stale answer cannot stick forever.
+  const latest = state.frames.at(-1);
+  const drift = signatureDifference(latest.signature, state.request.lastStepSignature ?? null);
+  const changedEnough = drift === null || drift >= REQUEST_CHANGE_DELTA;
+  if (!changedEnough && idleFor < REQUEST_IDLE_MAX_MS) {
+    state.router.stats.requestChecksSkipped = (state.router.stats.requestChecksSkipped || 0) + 1;
+    return;
+  }
   state.busy = true;
   state.request.lastStepMs = now;
+  state.request.lastStepSignature = latest.signature;
+  state.router.stats.requestCalls = (state.router.stats.requestCalls || 0) + 1;
   try {
     const motion = currentMotionDescription();
     const result = await post("/api/request", {
       action: "step",
-      frames: framesForUpload(2, 8_000),
+      // A narrow window keeps the model looking at what is in front of the user NOW, rather
+      // than at where they were eight seconds ago.
+      frames: framesForUpload(2, 3_500),
       ...(motion ? { motionDescription: motion } : {}),
       ...(state.sceneLabel ? { sceneLabel: state.sceneLabel } : {}),
     });
@@ -1721,15 +1848,33 @@ async function stepRequest() {
   finally { state.busy = false; updateActionState(); }
 }
 
+/** Character 2-gram overlap: the model words the same scene differently each call, so exact
+ *  equality would never fire and the user would be read the same thing over and over. */
+function isSameAnswer(a, b) {
+  if (!a || !b) return false;
+  if (a === b) return true;
+  const grams = (text) => { const set = new Set(); for (let i = 0; i < text.length - 1; i++) set.add(text.slice(i, i + 2)); return set; };
+  const setA = grams(a), setB = grams(b);
+  if (!setA.size || !setB.size) return false;
+  let shared = 0;
+  for (const gram of setA) if (setB.has(gram)) shared++;
+  const union = setA.size + setB.size - shared;
+  return union > 0 && shared / union >= 0.7;
+}
+
 function showRequestResult(result) {
   const kindLabel = { question: "回答", goal: "建议", watch: "关注" }[result.kind] || "回答";
+  const previous = state.request.lastAnswer;
+  const repeated = isSameAnswer(previous, result.answer);
   state.request.lastAnswer = result.answer;
   const frameHint = hasFrameRelativeDirection(result.answer) ? "（模型用了画面方位；实际方位以你身体为准）" : "";
   if ($("output")) $("output").textContent = `${kindLabel}：${result.answer}${frameHint}`;
-  if (result.shouldSpeak) {
+  if (result.shouldSpeak && !repeated) {
     setStatus($("app-status"), `◉ ${kindLabel}：${result.answer}${frameHint}`);
-    speak(result.answer);
-  } else setStatus($("app-status"), `${kindLabel}：${result.answer}${frameHint}（未提示）`);
+    // The answer to what the user is hunting for outranks anything we are already saying:
+    // speak it now instead of queueing behind a description that is already out of date.
+    speak(result.answer, SPEECH_URGENT);
+  } else setStatus($("app-status"), `${kindLabel}：${result.answer}${frameHint}${repeated ? "（与上次相同，未重复播报）" : "（未提示）"}`);
 }
 
 async function stopRequest() {
