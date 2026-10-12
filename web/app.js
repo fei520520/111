@@ -1416,6 +1416,7 @@ function primeSpeech() {
 
 // --- Speech playback queue: segments play one after another, never overlapping ---
 let speechChain = Promise.resolve();
+let speechCooldownUntil = 0;   // brief pause after speaking so we don't record our own audio
 
 function speak(text) {
   if (!$("speak-toggle")?.checked || !text) return;
@@ -1427,7 +1428,7 @@ function speak(text) {
 function speakOnce(text) {
   return new Promise((resolve) => {
     let settled = false;
-    const finish = () => { if (settled) return; settled = true; outputSpeaking = false; resolve(); };
+    const finish = () => { if (settled) return; settled = true; outputSpeaking = false; speechCooldownUntil = Date.now() + 900; resolve(); };
     outputSpeaking = true;
     if (!isAndroidDevice && typeof speechSynthesis !== "undefined") {
       if (!zhVoice) refreshVoices();
@@ -1561,7 +1562,7 @@ function vadVolume() {
 
 function vadTick() {
   // Ignore our own audio output and any in-flight analysis so we don't transcribe the reply.
-  if (!voiceAssistantOn || state.busy || outputSpeaking) return;
+  if (!voiceAssistantOn || state.busy || outputSpeaking || Date.now() < speechCooldownUntil) return;
   const volume = vadVolume();
   const now = Date.now();
   if (volume > VAD_THRESHOLD) {
@@ -1600,9 +1601,25 @@ async function handleSegment() {
     $("goal").value = text;
     updateActionState();
     setStatus($("voice-status"), `收到：${text}`);
-    speak(`收到，${text}`);
+    confirmTone();
     void submitRequest("ask");
   } catch { /* ignore a single bad segment and keep listening */ }
+}
+
+/** A short, quiet tone so the user knows their speech was captured (without echoing it back). */
+function confirmTone() {
+  try {
+    unlockAudio();
+    if (!audioCtx) return;
+    const oscillator = audioCtx.createOscillator();
+    const gain = audioCtx.createGain();
+    oscillator.frequency.value = 880;
+    gain.gain.value = 0.04;
+    oscillator.connect(gain);
+    gain.connect(audioCtx.destination);
+    oscillator.start();
+    oscillator.stop(audioCtx.currentTime + 0.12);
+  } catch { /* ignore */ }
 }
 
 function toggleVoiceInput() {
