@@ -492,6 +492,8 @@ async function login() {
     $("passcode").value = "";
     showApp();
     void syncTaskState().catch((error) => setStatus($("app-status"), error.message, true));
+    // Hands-free: begin listening right after login so a blind user never has to tap anything.
+    void startVoiceAssistant();
     setStatus($("app-status"), "验证成功，正在开启摄像头并请求权限…");
     void startCamera().catch((error) => setStatus($("app-status"), error.message, true));
   } catch (error) {
@@ -576,7 +578,7 @@ function updateActionState() {
   const hasGoal = $("goal").value.trim().length > 0;
   const ready = state.frames.length > 0 && !state.busy;
   const micButton = $("mic-button");
-  if (micButton) micButton.disabled = !(ready && voiceRecognition);
+  if (micButton) micButton.disabled = false;
   const active = state.request.status === "active";
   const mode = state.request.mode;
   const askButton = $("ask-button");
@@ -1361,55 +1363,287 @@ async function stopCurrentTask() {
 }
 
 // --- Voice input/output for the request line ---
-let voiceRecognition = null;
-let voiceListening = false;
+// Hands-free by design: the primary user is blind and cannot tap a button to start/stop
+// recording. The app listens continuously and uses a simple energy-based VAD to segment
+// the user's speech, then transcribes each segment on the server (/api/asr).
+const isAndroidDevice = /Android|HarmonyOS|Huawei|HONOR/i.test(navigator.userAgent || "");
+let voiceAssistantOn = false;
+let outputSpeaking = false;   // true while playing audio, so the VAD ignores our own voice
+const vad = { stream: null, ctx: null, analyser: null, timer: null, buffer: null, speaking: false, silenceSince: 0, startedAt: 0, recorder: null, chunks: [] };
+
+// --- Speech synthesis (voice output) ---
+// Mobile quirks handled: getVoices() loads late; the engine can get stuck "paused";
+// cancel()+speak() back-to-back can swallow the new utterance.
+let zhVoice = null;
+
+function refreshVoices() {
+  if (typeof speechSynthesis === "undefined") return;
+  const voices = speechSynthesis.getVoices?.() || [];
+  if (!voices.length) return;
+  zhVoice = voices.find((voice) => /zh[-_]?CN/i.test(voice.lang))
+    || voices.find((voice) => /^zh/i.test(voice.lang))
+    || voices.find((voice) => /Chinese|中文|普通话|Mandarin/i.test(voice.name))
+    || voices.find((voice) => voice.default)
+    || voices[0];
+}
+
+// Unlocked from a user gesture so server audio can play later without an autoplay block.
+let audioCtx = null;
+function unlockAudio() {
+  try {
+    const Ctx = window.AudioContext || window.webkitAudioContext;
+    if (!Ctx) return;
+    if (!audioCtx) audioCtx = new Ctx();
+    if (audioCtx.state === "suspended") void audioCtx.resume();
+  } catch { /* ignore */ }
+}
 
 /** Unlock speech synthesis on a user gesture (iOS/Chrome block the first unsolicited speak). */
 function primeSpeech() {
+  unlockAudio();
   if (typeof speechSynthesis === "undefined") return;
   try {
+    refreshVoices();
+    speechSynthesis.onvoiceschanged = refreshVoices;
     const utterance = new SpeechSynthesisUtterance(" ");
     utterance.volume = 0;
-    speechSynthesis.speak(utterance);
+    utterance.lang = "zh-CN";
+    if (zhVoice) utterance.voice = zhVoice;
     speechSynthesis.resume();
+    speechSynthesis.speak(utterance);
   } catch { /* ignore */ }
 }
 
 function speak(text) {
-  if (!$("speak-toggle")?.checked || !text || typeof speechSynthesis === "undefined") return;
+  if (!$("speak-toggle")?.checked || !text) return;
+  // Android (esp. HONOR/Huawei browsers) has no reliable local Chinese TTS -> use the server.
+  if (isAndroidDevice || typeof speechSynthesis === "undefined") { void speakViaServer(text); return; }
+  const voices = speechSynthesis.getVoices?.() || [];
+  if (!zhVoice) refreshVoices();
+  if (voices.length === 0 || !zhVoice) { void speakViaServer(text); return; }
+  let started = false;
+  const utterance = new SpeechSynthesisUtterance(text);
+  utterance.lang = "zh-CN";
+  utterance.voice = zhVoice;
+  utterance.rate = 1;
+  utterance.pitch = 1;
+  utterance.volume = 1;
+  outputSpeaking = true;
+  utterance.onstart = () => { started = true; };
+  utterance.onend = () => { outputSpeaking = false; };
+  utterance.onerror = () => { outputSpeaking = false; };
+  try { speechSynthesis.cancel(); } catch { /* ignore */ }
+  setTimeout(() => {
+    try { speechSynthesis.resume(); speechSynthesis.speak(utterance); } catch { /* ignore */ }
+  }, 60);
+  setTimeout(() => { if (!started) { outputSpeaking = false; void speakViaServer(text); } }, 1300);
+}
+
+function base64ToBytes(base64) {
+  const binary = atob(base64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return bytes;
+}
+
+/** Text-to-speech via the server (qwen3-tts); played through the unlocked AudioContext. */
+async function speakViaServer(text) {
+  if (!$("speak-toggle")?.checked) return;
   try {
-    const utterance = new SpeechSynthesisUtterance(text);
-    utterance.lang = "zh-CN";
-    speechSynthesis.cancel();
-    speechSynthesis.speak(utterance);
+    const result = await post("/api/tts", { text }, true, 30_000);
+    if (!result.audioBase64) return;
+    const bytes = base64ToBytes(result.audioBase64);
+    if (audioCtx) {
+      const buffer = await audioCtx.decodeAudioData(bytes.buffer.slice(0));
+      const source = audioCtx.createBufferSource();
+      source.buffer = buffer;
+      source.connect(audioCtx.destination);
+      outputSpeaking = true;
+      source.onended = () => { outputSpeaking = false; };
+      source.start();
+      return;
+    }
+    const audio = new Audio(`data:${result.mimeType || "audio/wav"};base64,${result.audioBase64}`);
+    outputSpeaking = true;
+    audio.onended = () => { outputSpeaking = false; };
+    await audio.play().catch(() => { outputSpeaking = false; });
   } catch { /* ignore */ }
 }
 
+/** Shows the key speech capabilities on the page so a phone-only user can see what's missing. */
+function reportVoiceDiagnostics() {
+  const hasSynth = typeof speechSynthesis !== "undefined";
+  const voiceCount = hasSynth ? (speechSynthesis.getVoices?.() || []).length : 0;
+  const zhCount = hasSynth ? (speechSynthesis.getVoices?.() || []).filter((voice) => /^zh/i.test(voice.lang)).length : 0;
+  const parts = [
+    `播报 ${hasSynth ? "✔" : "✘"} 音色${voiceCount}/中文${zhCount}${hasSynth && voiceCount === 0 ? "（系统未装语音引擎）" : ""}`,
+    voiceAssistantOn ? "语音助手：开" : "语音助手：关",
+  ];
+  const el = $("voice-status");
+  if (el) el.textContent = `语音诊断：${parts.join(" · ")}`;
+}
+
 function setupVoice() {
-  const Recognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+  if (typeof speechSynthesis !== "undefined") {
+    refreshVoices();
+    speechSynthesis.onvoiceschanged = refreshVoices;
+    $("speak-toggle")?.addEventListener("change", (event) => {
+      if (event.target.checked) { primeSpeech(); speak("语音播报已开启"); }
+    });
+  }
+  setTimeout(reportVoiceDiagnostics, 1200);
+}
+
+// --- Hands-free input: energy-based voice activity detection (VAD) ---
+const VAD_THRESHOLD = 0.045;   // RMS above this counts as speech
+const VAD_SILENCE_MS = 1400;   // this much silence ends an utterance
+const VAD_MAX_MS = 15000;      // hard cap on a single utterance
+
+async function startVoiceAssistant() {
+  if (voiceAssistantOn) return;
+  if (typeof MediaRecorder === "undefined" || !navigator.mediaDevices?.getUserMedia) {
+    setStatus($("voice-status"), "当前浏览器不支持录音，请改用 Chrome / Edge。", true);
+    return;
+  }
+  try {
+    vad.stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  } catch (error) {
+    setStatus($("voice-status"), `无法访问麦克风：${error.message}（需信任证书并允许麦克风）`, true);
+    return;
+  }
+  unlockAudio();
+  const Ctx = window.AudioContext || window.webkitAudioContext;
+  vad.ctx = new Ctx();
+  const source = vad.ctx.createMediaStreamSource(vad.stream);
+  vad.analyser = vad.ctx.createAnalyser();
+  vad.analyser.fftSize = 1024;
+  source.connect(vad.analyser);
+  vad.buffer = new Uint8Array(vad.analyser.fftSize);
+  voiceAssistantOn = true;
+  vad.timer = window.setInterval(vadTick, 90);
   const mic = $("mic-button");
-  if (!Recognition) { mic.disabled = true; mic.title = "当前浏览器不支持语音识别，请用键盘输入"; return; }
-  voiceRecognition = new Recognition();
-  voiceRecognition.lang = "zh-CN";
-  voiceRecognition.interimResults = false;
-  voiceRecognition.maxAlternatives = 1;
-  voiceRecognition.onstart = () => { voiceListening = true; mic.textContent = "🎙️ 正在听…"; setStatus($("voice-status"), "正在听……说完会自动提问。"); };
-  voiceRecognition.onend = () => { voiceListening = false; mic.textContent = "🎤 语音提问"; };
-  voiceRecognition.onerror = (event) => { voiceListening = false; mic.textContent = "🎤 语音提问"; setStatus($("voice-status"), `语音识别失败：${event.error}`); };
-  voiceRecognition.onresult = (event) => {
-    const transcript = event.results?.[0]?.[0]?.transcript?.trim();
-    if (!transcript) return;
-    $("goal").value = transcript;
+  mic.disabled = false;
+  mic.textContent = "🛑 暂停";
+  setStatus($("voice-status"), "语音助手已开启：直接说话，说完稍等即可。");
+  speak("语音助手已开启，请直接说您的问题");
+}
+
+function stopVoiceAssistant() {
+  voiceAssistantOn = false;
+  if (vad.timer) { window.clearInterval(vad.timer); vad.timer = null; }
+  try { if (vad.recorder && vad.recorder.state !== "inactive") vad.recorder.stop(); } catch { /* ignore */ }
+  try { vad.stream?.getTracks().forEach((track) => track.stop()); } catch { /* ignore */ }
+  vad.stream = null; vad.analyser = null; vad.speaking = false;
+  $("mic-button").textContent = "🎤 语音助手";
+  setStatus($("voice-status"), "语音助手已暂停。");
+}
+
+function vadVolume() {
+  if (!vad.analyser) return 0;
+  vad.analyser.getByteTimeDomainData(vad.buffer);
+  let sum = 0;
+  for (let i = 0; i < vad.buffer.length; i++) { const value = (vad.buffer[i] - 128) / 128; sum += value * value; }
+  return Math.sqrt(sum / vad.buffer.length);
+}
+
+function vadTick() {
+  // Ignore our own audio output and any in-flight analysis so we don't transcribe the reply.
+  if (!voiceAssistantOn || state.busy || outputSpeaking) return;
+  const volume = vadVolume();
+  const now = Date.now();
+  if (volume > VAD_THRESHOLD) {
+    vad.silenceSince = 0;
+    if (!vad.speaking) { vad.speaking = true; vad.startedAt = now; startSegment(); }
+  } else if (vad.speaking) {
+    if (!vad.silenceSince) vad.silenceSince = now;
+    if (now - vad.silenceSince > VAD_SILENCE_MS) { vad.speaking = false; stopSegment(); }
+  }
+  if (vad.speaking && now - vad.startedAt > VAD_MAX_MS) { vad.speaking = false; stopSegment(); }
+}
+
+function startSegment() {
+  vad.chunks = [];
+  const mimeType = MediaRecorder.isTypeSupported("audio/webm;codecs=opus") ? "audio/webm;codecs=opus"
+    : MediaRecorder.isTypeSupported("audio/webm") ? "audio/webm" : "";
+  vad.recorder = mimeType ? new MediaRecorder(vad.stream, { mimeType }) : new MediaRecorder(vad.stream);
+  vad.recorder.ondataavailable = (event) => { if (event.data && event.data.size) vad.chunks.push(event.data); };
+  vad.recorder.onstop = () => { void handleSegment(); };
+  vad.recorder.start();
+}
+
+function stopSegment() {
+  try { if (vad.recorder && vad.recorder.state !== "inactive") vad.recorder.stop(); } catch { /* ignore */ }
+}
+
+/** Transcribe one captured utterance on the server and submit it as a question. */
+async function handleSegment() {
+  if (!vad.chunks.length) return;
+  const blob = new Blob(vad.chunks, { type: vad.chunks[0].type || "audio/webm" });
+  try {
+    const audioBase64 = await blobToWavBase64(blob);
+    const result = await post("/api/asr", { audioBase64, mimeType: "audio/wav" }, true, 40_000);
+    const text = (result.text || "").trim();
+    if (!text || text.length < 2) return;   // ignore noise / short blips
+    $("goal").value = text;
     updateActionState();
-    setStatus($("voice-status"), `识别到：${transcript}`);
+    setStatus($("voice-status"), `收到：${text}`);
+    speak(`收到，${text}`);
     void submitRequest("ask");
-  };
+  } catch { /* ignore a single bad segment and keep listening */ }
 }
 
 function toggleVoiceInput() {
-  if (!voiceRecognition) return;
-  if (voiceListening) { voiceRecognition.stop(); return; }
-  try { voiceRecognition.start(); } catch { /* already started */ }
+  if (voiceAssistantOn) stopVoiceAssistant();
+  else void startVoiceAssistant();
+}
+
+/** Decode a recorded blob and re-encode it as 16 kHz mono WAV base64 for the ASR endpoint. */
+async function blobToWavBase64(blob) {
+  const arrayBuffer = await blob.arrayBuffer();
+  const AudioCtx = window.AudioContext || window.webkitAudioContext;
+  const ctx = new AudioCtx();
+  let decoded;
+  try { decoded = await ctx.decodeAudioData(arrayBuffer); } finally { void ctx.close(); }
+  const sampleRate = 16000;
+  const frames = Math.max(1, Math.round(decoded.duration * sampleRate));
+  const OfflineCtx = window.OfflineAudioContext || window.webkitOfflineAudioContext;
+  const offline = new OfflineCtx(1, frames, sampleRate);
+  const source = offline.createBufferSource();
+  source.buffer = decoded;
+  source.connect(offline.destination);
+  source.start();
+  const rendered = await offline.startRendering();
+  return encodeWavBase64(rendered.getChannelData(0), sampleRate);
+}
+
+function encodeWavBase64(samples, sampleRate) {
+  const buffer = new ArrayBuffer(44 + samples.length * 2);
+  const view = new DataView(buffer);
+  const writeString = (offset, text) => { for (let i = 0; i < text.length; i++) view.setUint8(offset + i, text.charCodeAt(i)); };
+  writeString(0, "RIFF");
+  view.setUint32(4, 36 + samples.length * 2, true);
+  writeString(8, "WAVE");
+  writeString(12, "fmt ");
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);
+  view.setUint16(22, 1, true);
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * 2, true);
+  view.setUint16(32, 2, true);
+  view.setUint16(34, 16, true);
+  writeString(36, "data");
+  view.setUint32(40, samples.length * 2, true);
+  let offset = 44;
+  for (let i = 0; i < samples.length; i++) {
+    const value = Math.max(-1, Math.min(1, samples[i]));
+    view.setInt16(offset, value < 0 ? value * 0x8000 : value * 0x7fff, true);
+    offset += 2;
+  }
+  const bytes = new Uint8Array(buffer);
+  let binary = "";
+  const chunk = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunk) binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
+  return btoa(binary);
 }
 
 /** Role 3: the user's explicit requirement. */
@@ -1500,6 +1734,7 @@ if (state.token && state.sessionId) {
   showApp();
   void syncTaskState().catch((error) => setStatus($("app-status"), error.message, true));
   void startCamera().catch((error) => setStatus($("app-status"), error.message, true));
+  void startVoiceAssistant();
 }
 
 window.addEventListener("pagehide", () => {

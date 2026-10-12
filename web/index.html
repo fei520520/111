@@ -37,13 +37,14 @@
 
       <section class="card ask-card">
         <div class="ask-row">
-          <button id="mic-button" class="primary icon" disabled title="按一下开始说话">🎤</button>
+          <button id="mic-button" class="primary icon" title="语音助手开关（登录后自动开启）">🎤</button>
           <input id="goal" type="text" maxlength="2000" placeholder="问点什么，或按 🎤 说话">
           <button id="ask-button" class="primary" disabled>发送</button>
         </div>
         <div id="output" class="output" aria-live="polite">回答会显示在这里。</div>
         <div class="ask-tools">
           <label class="inline"><input type="checkbox" id="speak-toggle" checked> 🔊 语音播报</label>
+          <button id="tts-test-button" class="secondary">🔊 测试播报</button>
           <button id="watch-button" class="secondary" disabled>关注这个情况</button>
           <button id="stop-task-button" class="secondary" disabled>结束</button>
         </div>

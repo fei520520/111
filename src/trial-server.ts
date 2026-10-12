@@ -169,6 +169,59 @@ async function handleLogin(req: IncomingMessage, res: ServerResponse): Promise<v
 	json(res, 200, { token, sessionId: id, expiresInSeconds: SESSION_TTL_MS / 1000 });
 }
 
+/** Speech-to-text for phones without on-device recognition (e.g. HONOR/Android without Google services). */
+const ASR_MODEL = process.env.QWEN_ASR_MODEL || "qwen3-asr-flash";
+
+async function handleAsr(req: IncomingMessage, res: ServerResponse): Promise<void> {
+	const input = await bodyJson(req, MAX_RECORDING_BODY_BYTES);
+	const audio = input.audioBase64;
+	if (typeof audio !== "string" || audio.length === 0) throw new Error("缺少音频数据");
+	const mimeType = typeof input.mimeType === "string" ? input.mimeType : "audio/wav";
+	const dataUri = audio.startsWith("data:") ? audio : `data:${mimeType};base64,${audio}`;
+	const format = ((mimeType.split("/")[1] || "wav").split(";")[0] || "wav").trim() || "wav";
+	const baseUrl = process.env.QWEN_BASE_URL!.replace(/\/+$/, "");
+	const response = await fetch(`${baseUrl}/chat/completions`, {
+		method: "POST",
+		headers: { "Content-Type": "application/json", Authorization: `Bearer ${process.env.QWEN_API_KEY}` },
+		body: JSON.stringify({
+			model: ASR_MODEL,
+			messages: [{ role: "user", content: [{ type: "input_audio", input_audio: { data: dataUri, format } }] }],
+		}),
+	});
+	const result = await response.json().catch(() => ({})) as { choices?: Array<{ message?: { content?: string } }>; error?: { message?: string } };
+	if (!response.ok) throw new Error(result?.error?.message || `语音识别请求失败 (${response.status})`);
+	json(res, 200, { text: result.choices?.[0]?.message?.content?.trim() ?? "" });
+}
+
+/** Server-side text-to-speech fallback for phones without a usable local TTS voice. */
+const TTS_MODEL = process.env.QWEN_TTS_MODEL || "qwen3-tts-flash";
+const TTS_VOICE = process.env.QWEN_TTS_VOICE || "Cherry";
+
+async function handleTts(req: IncomingMessage, res: ServerResponse): Promise<void> {
+	const input = await bodyJson(req);
+	const text = input.text;
+	if (typeof text !== "string" || !text.trim()) throw new Error("缺少要合成的文本");
+	if (text.length > 600) throw new Error("文本过长（最多 600 字）");
+	const origin = new URL(process.env.QWEN_BASE_URL!).origin;
+	const endpoint = `${origin}/api/v1/services/aigc/multimodal-generation/generation`;
+	const response = await fetch(endpoint, {
+		method: "POST",
+		headers: { "Content-Type": "application/json", Authorization: `Bearer ${process.env.QWEN_API_KEY}` },
+		body: JSON.stringify({ model: TTS_MODEL, input: { text, voice: TTS_VOICE, language_type: "Chinese" } }),
+	});
+	const result = await response.json().catch(() => ({})) as { output?: { audio?: { data?: string; url?: string } }; message?: string };
+	const audio = result.output?.audio;
+	if (!response.ok || !audio) throw new Error(result?.message || `语音合成失败 (${response.status})`);
+	let base64 = audio.data ?? "";
+	if (!base64 && audio.url) {
+		const audioResponse = await fetch(audio.url);
+		if (!audioResponse.ok) throw new Error("下载合成音频失败");
+		base64 = Buffer.from(await audioResponse.arrayBuffer()).toString("base64");
+	}
+	if (!base64) throw new Error("语音合成未返回音频");
+	json(res, 200, { audioBase64: base64, mimeType: "audio/wav" });
+}
+
 async function handleObserve(req: IncomingMessage, res: ServerResponse, session: { id: string; requests: number[] }): Promise<void> {
 	const input = await bodyJson(req);
 	if (typeof input.goal !== "string" || input.goal.length > 2000) throw new Error("目标文字必须是 2000 字以内的字符串");
@@ -987,6 +1040,16 @@ async function main(): Promise<void> {
 			if (pathname === "/api/request") {
 				if (!process.env.QWEN_API_KEY || !process.env.QWEN_BASE_URL) { json(res, 503, { error: "VLM API is not configured" }); return; }
 				await handleRequest(req, res, session);
+				return;
+			}
+			if (pathname === "/api/asr") {
+				if (!process.env.QWEN_API_KEY || !process.env.QWEN_BASE_URL) { json(res, 503, { error: "VLM API is not configured" }); return; }
+				await handleAsr(req, res);
+				return;
+			}
+			if (pathname === "/api/tts") {
+				if (!process.env.QWEN_API_KEY || !process.env.QWEN_BASE_URL) { json(res, 503, { error: "VLM API is not configured" }); return; }
+				await handleTts(req, res);
 				return;
 			}
 			if (pathname === "/api/task") { await handleTask(req, res, session.id); return; }
