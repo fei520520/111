@@ -668,7 +668,7 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse, session:
 				transitions: (sceneState?.transitions ?? []).map((edge) => ({ from: edge.fromScene, to: edge.toScene, count: edge.count, path: edge.path })),
 				changes: (changeState?.events ?? []).map((event) => ({ sceneId: event.sceneId, what: event.what, atMs: event.atMs })),
 			};
-		});
+		}, resolve("run", "request-memory.json"));
 		if (requestAgents.size >= MAX_SESSIONS) requestAgents.delete(requestAgents.keys().next().value!);
 		requestAgents.set(session.id, agent);
 	}

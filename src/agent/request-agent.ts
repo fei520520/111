@@ -1,5 +1,5 @@
-import { readFile } from "node:fs/promises";
-import { extname } from "node:path";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { dirname, extname } from "node:path";
 import { Agent, type AgentTool } from "@earendil-works/pi-agent-core";
 import type { ImageContent, Model } from "@earendil-works/pi-ai";
 import { createQwenModel } from "./qwen-provider.js";
@@ -94,6 +94,10 @@ const SYSTEM_PROMPT = [
 	'Reply with ONLY JSON: {"kind": "question|goal|watch", "answer": string, "shouldSpeak": boolean, "done": boolean, "confidence": number}. No markdown.',
 ].join(" ");
 
+/** Long-term memory limits: keep many turns on disk, feed the most recent ones to the model. */
+const MAX_HISTORY = 50;
+const PROMPT_HISTORY = 12;
+
 function mimeTypeFor(path: string): string {
 	switch (extname(path).toLowerCase()) {
 		case ".jpg": case ".jpeg": return "image/jpeg";
@@ -131,10 +135,33 @@ export class RequestAgent {
 	 */
 	private history: Array<{ question: string; answer: string }> = [];
 
-	constructor(private readonly getSceneMemory: SceneMemoryProvider | null = null) {
+	constructor(private readonly getSceneMemory: SceneMemoryProvider | null = null, private readonly storePath: string | null = null) {
 		const configured = createQwenModel(512);
 		this.model = configured.model;
 		this.streamFn = configured.streamFn;
+		void this.loadHistory();
+	}
+
+	/** Load long-term memory from disk so context survives restarts and new sessions. */
+	private async loadHistory(): Promise<void> {
+		if (!this.storePath) return;
+		try {
+			const data = JSON.parse(await readFile(this.storePath, "utf8")) as Array<{ question?: unknown; answer?: unknown }>;
+			if (Array.isArray(data)) {
+				this.history = data
+					.filter((turn) => typeof turn?.question === "string" && typeof turn?.answer === "string")
+					.map((turn) => ({ question: turn.question as string, answer: turn.answer as string }))
+					.slice(-MAX_HISTORY);
+			}
+		} catch { /* fresh memory */ }
+	}
+
+	private async saveHistory(): Promise<void> {
+		if (!this.storePath) return;
+		try {
+			await mkdir(dirname(this.storePath), { recursive: true });
+			await writeFile(this.storePath, JSON.stringify(this.history.slice(-MAX_HISTORY)), "utf8");
+		} catch { /* best effort */ }
 	}
 
 	/** Optional tool: look up visited places and recent changes. The agent decides when to call it. */
@@ -205,7 +232,7 @@ export class RequestAgent {
 		})));
 
 		const recent = this.state.turns.slice(-3).map((turn) => ({ kind: turn.kind, answer: turn.answer, spoke: turn.shouldSpeak }));
-		const historyText = this.history.slice(-4).map((turn) => `the user asked: ${turn.question}\nyou answered: ${turn.answer}`).join("\n");
+		const historyText = this.history.slice(-PROMPT_HISTORY).map((turn) => `the user asked: ${turn.question}\nyou answered: ${turn.answer}`).join("\n");
 		const promptLines = [
 			"Answer the user's requirement using the current frames. Image blocks are in chronological order.",
 			`CONVERSATION SO FAR (earlier turns; the user may be following up on these — e.g. "is this it?" refers to the item they were previously looking for):\n${historyText || "(none)"}`,
@@ -242,7 +269,8 @@ export class RequestAgent {
 		const previous = this.history[this.history.length - 1];
 		if (previous && previous.question === question) previous.answer = parsed.answer;
 		else this.history.push({ question, answer: parsed.answer });
-		if (this.history.length > 6) this.history = this.history.slice(-6);
+		if (this.history.length > MAX_HISTORY) this.history = this.history.slice(-MAX_HISTORY);
+		void this.saveHistory();
 
 		return { ...parsed, shouldSpeak, done, frameIds: [ordered[ordered.length - 1]!.id], raw };
 	}
