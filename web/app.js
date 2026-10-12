@@ -1416,7 +1416,6 @@ function primeSpeech() {
 
 // --- Speech playback queue: segments play one after another, never overlapping ---
 let speechChain = Promise.resolve();
-let outputSpeaking = false;
 
 function speak(text) {
   if (!$("speak-toggle")?.checked || !text) return;
