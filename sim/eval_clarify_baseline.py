@@ -62,6 +62,22 @@ def parse_reply(text: str) -> dict:
     return {"answer": answer.strip(), "confidence": confidence, "can_answer": can_answer}
 
 
+def char_ngrams(text: str, n: int = 2) -> set:
+    """Character n-grams of a (possibly Chinese) string. Used for a cheap answer-similarity score."""
+    compact = re.sub(r"\s+", "", text)
+    if len(compact) < n:
+        return {compact} if compact else set()
+    return {compact[i:i + n] for i in range(len(compact) - n + 1)}
+
+
+def answer_similarity(a: str, b: str) -> float:
+    """Jaccard similarity over character 2-grams. 1.0 = same answer, 0.0 = unrelated."""
+    ga, gb = char_ngrams(a), char_ngrams(b)
+    if not ga or not gb:
+        return 0.0
+    return round(len(ga & gb) / len(ga | gb), 3)
+
+
 def ask(client, model: str, path: Path, question: str) -> dict:
     content = [
         {"type": "text", "text": PROMPT.replace("{question}", question)},
@@ -87,6 +103,10 @@ def load_manifest(dataset: Path, limit: int) -> list[dict]:
     return rows[:limit] if limit > 0 else rows
 
 
+OVERCONFIDENT_CONF = 0.7   # claiming this much confidence...
+OVERCONFIDENT_SIM = 0.3    # ...while the answer barely matches the clean one
+
+
 def summarize(records: list[dict]) -> dict:
     by_kind: dict[str, list[dict]] = defaultdict(list)
     for row in records:
@@ -96,15 +116,40 @@ def summarize(records: list[dict]) -> dict:
     for kind, rows in sorted(by_kind.items()):
         conf = [r["ambiguous"]["confidence"] for r in rows]
         clean = [r["clean"]["confidence"] for r in rows]
+        sim = [r.get("similarityToClean", 0.0) for r in rows]
+        overconfident = [r for r in rows if r["ambiguous"]["confidence"] >= OVERCONFIDENT_CONF and r.get("similarityToClean", 0.0) < OVERCONFIDENT_SIM]
         stats[kind] = {
             "n": len(rows),
             "ambiguousConfidenceMean": round(sum(conf) / len(conf), 3),
             "cleanConfidenceMean": round(sum(clean) / len(clean), 3),
             "confidenceDrop": round(sum(clean) / len(clean) - sum(conf) / len(conf), 3),
+            "similarityToCleanMean": round(sum(sim) / len(sim), 3),
+            "overconfidentRate": round(len(overconfident) / len(rows), 3),
             "ambiguousCannotAnswerRate": round(sum(1 for r in rows if not r["ambiguous"]["can_answer"]) / len(rows), 3),
             "cleanCannotAnswerRate": round(sum(1 for r in rows if not r["clean"]["can_answer"]) / len(rows), 3),
         }
     return stats
+
+
+def risk_coverage(records: list[dict], sim_threshold: float = 0.3) -> list[dict]:
+    """Sort answers by confidence; as coverage grows, report the error rate.
+
+    'Correct' here = the degraded-image answer is similar enough to the clean-image answer.
+    A well-calibrated model keeps low error even at high coverage; an overconfident one does not.
+    """
+    labeled = [(r["ambiguous"]["confidence"], 1 if r.get("similarityToClean", 0.0) >= sim_threshold else 0) for r in records]
+    labeled.sort(key=lambda item: -item[0])
+    n = len(labeled)
+    if n == 0:
+        return []
+    curve = []
+    for step in range(1, 11):
+        coverage = round(step / 10, 1)
+        k = max(1, int(n * coverage))
+        subset = labeled[:k]
+        error = 1 - sum(correct for _, correct in subset) / len(subset)
+        curve.append({"coverage": coverage, "n": len(subset), "error": round(error, 3)})
+    return curve
 
 
 def main() -> None:
@@ -149,6 +194,7 @@ def main() -> None:
                 "sourceImage": row["source_image"],
                 "ambiguous": ambiguous,
                 "clean": clean_cache[key],
+                "similarityToClean": answer_similarity(ambiguous["answer"], clean_cache[key]["answer"]),
             }
             records.append(record)
             out.write(json.dumps(record, ensure_ascii=False) + "\n")
@@ -161,6 +207,7 @@ def main() -> None:
         "samples": len(records),
         "datasetSha256": hashlib.sha256((args.dataset / "manifest.jsonl").read_bytes()).hexdigest(),
         "stats": summarize(records),
+        "riskCoverage": risk_coverage(records),
         "note": "Self-reported confidence from a single VLM call per image. Not calibrated probabilities; developer baseline, not blind validation.",
     }
     (args.out / "report.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
