@@ -68,7 +68,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Generate one clarification for an ambiguous image.")
     parser.add_argument("--dataset", required=True, type=Path)
     parser.add_argument("--out", required=True, type=Path)
-    parser.add_argument("--model", default=os.getenv("QWEN_MODEL", "qwen3-vl-plus"))
+    parser.add_argument("--model", default="qwen3-vl-plus", help="Pinned for reproducibility with the n=250 baseline; pass --model explicitly to run another model.")
     parser.add_argument("--question", default=DEFAULT_QUESTION)
     parser.add_argument("--expected-action", default=None, choices=["ask_view", "ask_verbal"],
                         help="Expected action to score against when the manifest row does not carry one.")

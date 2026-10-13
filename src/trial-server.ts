@@ -12,6 +12,8 @@ import { VlmHarness, type AnalysisMode, type AttentionMode, type FrameRef, type 
 import { SceneAgent } from "./agent/scene-agent.js";
 import { SceneChangeAgent } from "./agent/scene-change-agent.js";
 import { RequestAgent } from "./agent/request-agent.js";
+import { decideUtterance, fifoPolicy, safetyFirstPolicy, type SpokenRecord, type Utterance, type UtteranceKind } from "./agent/response-arbiter.js";
+import { HAZARD_PROMPT, hazardToUtterance, parseHazardReply } from "./agent/hazard-watch.js";
 
 const PORT = Number(process.env.VLM_TRIAL_PORT || "8765");
 /** LAN IPv4 captured by scripts/setup-lan-tls.ps1, used only for console hints. */
@@ -723,6 +725,150 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse, session:
 	});
 }
 
+const UTTERANCE_KINDS: readonly UtteranceKind[] = ["safety", "clarify", "task", "ambient"];
+
+/** Parse and bound one speech candidate coming from the phone. */
+function parseUtterance(value: unknown): Utterance {
+	if (typeof value !== "object" || value === null || Array.isArray(value)) throw new Error("candidate 格式错误");
+	const row = value as Record<string, unknown>;
+	const rawKind = row.kind;
+	const kind = typeof rawKind === "string" ? UTTERANCE_KINDS.find((candidate) => candidate === rawKind) : undefined;
+	if (!kind) throw new Error("candidate.kind 必须是 safety、clarify、task 或 ambient");
+	if (typeof row.id !== "string" || !row.id.trim()) throw new Error("candidate.id 缺失");
+	if (typeof row.text !== "string" || !row.text.trim()) throw new Error("candidate.text 缺失");
+	const ttlMs = typeof row.ttlMs === "number" && row.ttlMs > 0 ? Math.min(row.ttlMs, 120_000) : 10_000;
+	const createdAtMs = typeof row.createdAtMs === "number" ? row.createdAtMs : Date.now();
+	const source = typeof row.source === "string" && row.source ? row.source.slice(0, 40) : kind;
+	const evidence = Array.isArray(row.evidence) ? row.evidence.filter((item): item is string => typeof item === "string").slice(0, 20) : null;
+	const confidence = typeof row.confidence === "number" ? row.confidence : null;
+	const latchKey = typeof row.latchKey === "string" && row.latchKey ? row.latchKey.slice(0, 80) : null;
+	return {
+		id: row.id,
+		kind,
+		text: row.text.trim().slice(0, 500),
+		createdAtMs,
+		ttlMs,
+		source,
+		...(evidence && evidence.length > 0 ? { evidence } : {}),
+		...(confidence === null ? {} : { confidence }),
+		...(latchKey === null ? {} : { latchKey }),
+	};
+}
+
+function parseSpokenRecord(value: unknown): SpokenRecord | null {
+	if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
+	const row = value as Record<string, unknown>;
+	try {
+		return { utterance: parseUtterance(value), atMs: typeof row.atMs === "number" ? row.atMs : Date.now() };
+	} catch {
+		return null;
+	}
+}
+
+function parseUtteranceList(value: unknown, limit: number): Utterance[] {
+	if (!Array.isArray(value)) return [];
+	const rows: Utterance[] = [];
+	for (const item of value.slice(0, limit)) {
+		try { rows.push(parseUtterance(item)); } catch { /* malformed entries are skipped, not fatal */ }
+	}
+	return rows;
+}
+
+function parseSpokenList(value: unknown, limit: number): SpokenRecord[] {
+	if (!Array.isArray(value)) return [];
+	const rows: SpokenRecord[] = [];
+	for (const item of value.slice(0, limit)) {
+		const record = parseSpokenRecord(item);
+		if (record) rows.push(record);
+	}
+	return rows;
+}
+
+/**
+ * Who may own the single voice channel right now?
+ *
+ * The decision is deliberately stateless on the server: the phone keeps the queue and reports what
+ * is playing, so any decision can be replayed offline from events.jsonl. Every choice is recorded,
+ * because the measurements that matter (preemption rate, interrupted answers, alarm fatigue) only
+ * exist if they are logged.
+ */
+async function handleArbiter(req: IncomingMessage, res: ServerResponse, session: { id: string }): Promise<void> {
+	const input = await bodyJson(req);
+	const candidate = parseUtterance(input.candidate);
+	const nowMs = typeof input.nowMs === "number" ? input.nowMs : Date.now();
+	const policy = input.policy === "fifo" ? fifoPolicy : safetyFirstPolicy;
+	const decision = decideUtterance(candidate, {
+		pending: parseUtteranceList(input.pending, 20),
+		speaking: parseSpokenRecord(input.speaking),
+		recent: parseSpokenList(input.recent, 20),
+	}, nowMs, policy);
+	await appendSessionEvent(experimentRoot, session.id, {
+		type: "arbiter_decision",
+		goal: candidate.text.slice(0, 200),
+		details: { policy: policy.name, source: candidate.source, ...decision.record },
+	});
+	json(res, 200, {
+		action: decision.action,
+		reason: decision.reason,
+		speak: decision.speak,
+		preemptedId: decision.preemptedId,
+		resume: decision.resume,
+		pending: decision.nextState.pending,
+		record: decision.record,
+	});
+}
+
+const HAZARD_MODEL = process.env.QWEN_HAZARD_MODEL || process.env.QWEN_MODEL || "qwen3.8-flash";
+
+/**
+ * Safety check for one look at the scene.
+ *
+ * Kept separate from /api/observe on purpose: the duty is that the user does not get hurt, so this
+ * runs at its own cadence with a prompt that only worries about danger, and it cannot be diluted by
+ * whatever the general observation prompt is busy with. This endpoint only looks; the caller
+ * decides what to do with the verdict.
+ */
+async function handleHazard(req: IncomingMessage, res: ServerResponse, session: { id: string }): Promise<void> {
+	const input = await bodyJson(req);
+	if (!Array.isArray(input.frames) || input.frames.length < 1 || input.frames.length > 3) throw new Error("hazard 需要 1 到 3 张截图");
+	const motionDescription = typeof input.motionDescription === "string" ? input.motionDescription.slice(0, 600) : "";
+	const runId = randomUUID();
+	const stagingDir = resolve("run/mobile-staging", session.id, `hazard-${runId}`);
+	await mkdir(stagingDir, { recursive: true });
+	const content: Array<Record<string, unknown>> = [{ type: "text", text: motionDescription ? `${HAZARD_PROMPT}\n\n用户此刻的运动状态：${motionDescription}` : HAZARD_PROMPT }];
+	const frameIds: string[] = [];
+	for (const [index, item] of input.frames.entries()) {
+		if (typeof item !== "object" || item === null || Array.isArray(item)) throw new Error(`截图 ${index + 1} 格式错误`);
+		const row = item as Record<string, unknown>;
+		if (typeof row.dataBase64 !== "string" || typeof row.timestampMs !== "number") throw new Error(`截图 ${index + 1} 缺少图像或时间戳`);
+		const mime = row.mimeType;
+		const extension = mime === "image/jpeg" ? ".jpg" : mime === "image/png" ? ".png" : mime === "image/webp" ? ".webp" : null;
+		if (!extension) throw new Error("截图只支持 JPEG、PNG 或 WebP");
+		const bytes = Buffer.from(row.dataBase64, "base64");
+		if (bytes.length === 0 || bytes.length > MAX_IMAGE_BYTES) throw new Error("每张截图最大为 1.5 MB");
+		await writeFile(resolve(stagingDir, `frame-${String(index + 1).padStart(2, "0")}${extension}`), bytes);
+		frameIds.push(`hazard-${index + 1}-${Math.round(row.timestampMs)}`);
+		content.push({ type: "image_url", image_url: { url: `data:${String(mime)};base64,${row.dataBase64}` } });
+	}
+	const baseUrl = process.env.QWEN_BASE_URL!.replace(/\/+$/, "");
+	const started = Date.now();
+	const response = await fetch(`${baseUrl}/chat/completions`, {
+		method: "POST",
+		headers: { "Content-Type": "application/json", Authorization: `Bearer ${process.env.QWEN_API_KEY}` },
+		body: JSON.stringify({ model: HAZARD_MODEL, messages: [{ role: "user", content }], temperature: 0, max_tokens: 300 }),
+	});
+	const result = await response.json().catch(() => ({})) as { choices?: Array<{ message?: { content?: string } }>; error?: { message?: string } };
+	if (!response.ok) throw new Error(result?.error?.message || `危险检测请求失败 (${response.status})`);
+	const raw = result.choices?.[0]?.message?.content ?? "";
+	const assessment = parseHazardReply(raw, frameIds);
+	const utterance = hazardToUtterance(assessment, Date.now());
+	await appendSessionEvent(experimentRoot, session.id, {
+		type: "hazard_assessed",
+		details: { ...assessment, model: HAZARD_MODEL, elapsedMs: Date.now() - started, raw: raw.slice(0, 400) },
+	});
+	json(res, 200, { assessment, utterance });
+}
+
 function parseMotionCalibration(value: unknown): MotionCalibration | undefined {
 	if (value === undefined || value === null) return undefined;
 	if (typeof value !== "object" || Array.isArray(value)) return undefined;
@@ -1022,6 +1168,12 @@ async function main(): Promise<void> {
 			if (!session) return;
 			rateLimit(session);
 			if (pathname === "/api/live/batch") { await handleLiveBatch(req, res, session); return; }
+			if (pathname === "/api/arbiter") { await handleArbiter(req, res, session); return; }
+			if (pathname === "/api/hazard") {
+				if (!process.env.QWEN_API_KEY || !process.env.QWEN_BASE_URL) { json(res, 503, { error: "VLM API is not configured" }); return; }
+				await handleHazard(req, res, session);
+				return;
+			}
 			if (pathname === "/api/observe") {
 				if (!process.env.QWEN_API_KEY || !process.env.QWEN_BASE_URL) { json(res, 503, { error: "VLM API is not configured" }); return; }
 				await handleObserve(req, res, session);

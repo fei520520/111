@@ -4,6 +4,19 @@ const MONITOR_MAX_WINDOW_MS = 30_000;
 const MONITOR_MAX_FRAMES = 8;
 const AWARENESS_RECHECK_INTERVAL_MS = 5_000;
 const CAPTURE_INTERVAL_MS = 1_000;
+/**
+ * Safety look cadence. Danger is the one producer that must not wait for the routine observation
+ * budget: the router asks "is this a new place", this asks "is something about to hurt him", so it
+ * runs on its own clock with its own prompt and its own frames. HAZARD_FRAMES stays at 3 because the
+ * endpoint takes a short, close look (1–3 frames), not a wide sweep; HAZARD_RECHECK_MS re-verifies a
+ * danger that is still live, so someone walking toward the same step keeps being reminded even
+ * though the picture barely changed.
+ */
+const HAZARD_CHECK_INTERVAL_MS = 3_000;
+const HAZARD_RECHECK_MS = 12_000;
+const HAZARD_CHANGE_DELTA = 0.04;
+const HAZARD_FRAMES = 3;
+const HAZARD_SEVERITY_LABEL = { halt: "必须停下", caution: "留意", clear: "安全" };
 /** Unconditional background save cadence while the camera is on. */
 const LIVE_SYNC_INTERVAL_MS = 5_000;
 /** On-device VIO-lite: small grayscale frames, ~15fps. */
@@ -54,7 +67,7 @@ function emptyRouterStats() {
 	return { capturedFrames: 0, movingFramesSkipped: 0, sensorMotionGatedFrames: 0, noChangeFramesSkipped: 0, familiarSceneFramesSkipped: 0, stabilityWaits: 0, frameChangeScore: null, visualNoveltyScore: null, motionContext: null };
 }
 
-const state = { token: sessionStorage.getItem("vlm-token"), sessionId: sessionStorage.getItem("vlm-session"), stream: null, frames: [], captureTimer: null, monitorCursorMs: null, captureBusy: false, busy: false, currentRequestMode: null, pendingDeepGoal: null, pendingDeepReason: null, pendingMonitorReason: null, pendingTaskStop: false, activeTask: null, activeWatch: null, lastRunId: null, sceneStatus: "未开始", changeStatus: "未开始", sceneLabel: null, sceneId: null, request: { mode: null, kind: null, status: "idle", text: null, lastAnswer: null, spoken: false, lastStepMs: 0 }, live: { pendingFrames: [], pendingMotionSamples: [], timer: null }, vio: { canvas: null, ctx: null, prevGray: null, prevAlpha: null, prevTickMs: 0, prevAbsHeading: null, features: [], startMs: 0, timer: null, placeTimer: null, lastPlaceMs: 0, lastSceneChangeMs: 0, lastSceneSignature: null }, motion: { samples: [], orientations: [], lastActivityAt: null, lastAbsoluteMs: 0, absoluteHeadingDeg: null, angularState: "unknown", linearState: "unknown", calibration: null, listenerActive: false, motionPermission: "unknown", orientationPermission: "unknown" }, router: { baselineSignature: null, knownViewSignatures: [], stableFrames: 0, lastAnalysisMs: 0, lastTriggerAt: 0, motionSignature: null, frameChangeHistory: [], noveltyHistory: [], stats: emptyRouterStats() } };
+const state = { token: sessionStorage.getItem("vlm-token"), sessionId: sessionStorage.getItem("vlm-session"), stream: null, frames: [], captureTimer: null, monitorCursorMs: null, captureBusy: false, busy: false, currentRequestMode: null, pendingDeepGoal: null, pendingDeepReason: null, pendingMonitorReason: null, pendingTaskStop: false, activeTask: null, activeWatch: null, hazard: { status: "未开始", lastCheckMs: 0, lastSignature: null, pending: false, dangerLive: false, checks: 0, skipped: 0, timer: null }, lastRunId: null, sceneStatus: "未开始", changeStatus: "未开始", sceneLabel: null, sceneId: null, request: { mode: null, kind: null, status: "idle", text: null, lastAnswer: null, spoken: false, lastStepMs: 0 }, live: { pendingFrames: [], pendingMotionSamples: [], timer: null }, vio: { canvas: null, ctx: null, prevGray: null, prevAlpha: null, prevTickMs: 0, prevAbsHeading: null, features: [], startMs: 0, timer: null, placeTimer: null, lastPlaceMs: 0, lastSceneChangeMs: 0, lastSceneSignature: null }, motion: { samples: [], orientations: [], lastActivityAt: null, lastAbsoluteMs: 0, absoluteHeadingDeg: null, angularState: "unknown", linearState: "unknown", calibration: null, listenerActive: false, motionPermission: "unknown", orientationPermission: "unknown" }, router: { baselineSignature: null, knownViewSignatures: [], stableFrames: 0, lastAnalysisMs: 0, lastTriggerAt: 0, motionSignature: null, frameChangeHistory: [], noveltyHistory: [], stats: emptyRouterStats() } };
 
 async function post(path, payload, authenticated = true, timeoutMs = 25_000) {
   const headers = { "Content-Type": "application/json" };
@@ -555,6 +568,7 @@ async function startCamera({ autoObserve = false } = {}) {
   void captureFrame().catch((error) => setStatus($("app-status"), error.message, true));
   startLiveSync();
   startVio();
+  startHazardWatch();
   updateActionState();
   const motionStatus = motionPermission === "denied" || motionPermission === "error" ? "运动传感器不可用" : "手机运动传感器已请求权限";
   const orientationStatus = orientationPermission === "denied" || orientationPermission === "error" ? "，姿态传感器不可用" : "";
@@ -566,6 +580,8 @@ async function startCamera({ autoObserve = false } = {}) {
 function stopCamera() {
   $("auto-analyze").checked = false;
   updateAutoAnalyze();
+  if ($("hazard-watch-toggle")) $("hazard-watch-toggle").checked = false;
+  stopHazardWatch();
   if (state.stream) for (const track of state.stream.getTracks()) track.stop();
   window.removeEventListener("devicemotion", onDeviceMotion);
   window.removeEventListener("deviceorientation", onDeviceOrientation);
@@ -603,6 +619,8 @@ function updateActionState() {
   watchButton.textContent = active && mode === "watch" ? "重新关注" : "关注这个情况";
   $("auto-observe-button").disabled = !state.stream;
   $("auto-observe-button").textContent = $("auto-analyze").checked ? "暂停后台记录" : "恢复后台记录";
+  const hazardToggle = $("hazard-watch-toggle");
+  if (hazardToggle) hazardToggle.disabled = !state.stream;
   $("stop-task-button").disabled = !active;
   $("stop-task-button").textContent = state.pendingTaskStop ? "等待结束…" : "结束要求";
   const kindLabel = { question: "提问", goal: "目标", watch: "关注" };
@@ -636,7 +654,14 @@ function updateDiagnostics() {
   // is that skipped checks (free) should far outnumber actual calls (paid).
   const calls = state.router.stats.requestCalls || 0;
   const skipped = state.router.stats.requestChecksSkipped || 0;
-  el.textContent = `摄像头：${camera}\n运动传感器：${motion}\n姿态传感器：${orientation}\n截图缓冲：${state.frames.length} 帧 · VIO 特征：${state.vio.features.length}\n找东西：模型调用 ${calls} 次 · 省下 ${skipped} 次（${calls + skipped > 0 ? Math.round(skipped / (calls + skipped) * 100) : 0}% 未调用）`;
+  // The safety counter is listed separately on purpose: it is not part of the change-driven budget,
+  // so folding it in would make the "how much did we save" number meaningless.
+  const hazard = state.hazard;
+  const hazardOn = Boolean($("hazard-watch-toggle")?.checked);
+  const hazardLine = hazardOn
+    ? `危险检测：检查 ${hazard.checks} 次 · 省下 ${hazard.skipped} 次 · ${hazard.status}`
+    : "危险检测：未开启";
+  el.textContent = `摄像头：${camera}\n运动传感器：${motion}\n姿态传感器：${orientation}\n截图缓冲：${state.frames.length} 帧 · VIO 特征：${state.vio.features.length}\n找东西：模型调用 ${calls} 次 · 省下 ${skipped} 次（${calls + skipped > 0 ? Math.round(skipped / (calls + skipped) * 100) : 0}% 未调用）\n${hazardLine}`;
 }
 
 function renderFrames() {
@@ -995,6 +1020,87 @@ async function maybeObserveSceneChange() {
   await runSceneChange(frames, state.sceneId);
 }
 
+/**
+ * Role 3 safety watch: one short look at the scene, on its own cadence.
+ *
+ * Unlike the scene roles this one does NOT share the "am I busy" gate of the request flows. Being
+ * mid-answer must never be the reason a danger goes unsaid, and a warning that waits behind a long
+ * scene reply is a warning the user may not hear before the step. It therefore only guards against
+ * overlapping its own calls, and it hands its verdict to the arbiter, which is what can preempt.
+ *
+ * The check itself is still gated on the view having changed, or on a live danger being due for a
+ * reminder: re-sending an unchanged picture cannot produce a new verdict, and that call is not free.
+ * A verdict of "danger" is latched by `latchKey`, so the same step the user keeps walking toward is
+ * repeated at its own reminder interval instead of being silenced by the generic cooldown.
+ *
+ * A failed check is reported as a failure and never as "safe": silence is not evidence of safety.
+ */
+async function maybeHazardWatch() {
+  const hazard = state.hazard;
+  if (!$("hazard-watch-toggle")?.checked) { hazard.status = "未开启"; return; }
+  if (!state.token || !state.stream || state.frames.length === 0 || hazard.pending) return;
+  const now = Date.now();
+  if (now - hazard.lastCheckMs < HAZARD_CHECK_INTERVAL_MS) return;
+  const latest = state.frames.at(-1);
+  const changed = hazard.lastSignature === null || (signatureDifference(latest.signature, hazard.lastSignature) ?? 1) >= HAZARD_CHANGE_DELTA;
+  const reminderDue = hazard.dangerLive && now - hazard.lastCheckMs >= HAZARD_RECHECK_MS;
+  if (!changed && !reminderDue) { hazard.skipped++; return; }
+  const frames = framesForUpload(HAZARD_FRAMES, 12_000);
+  if (!frames.length) return;
+  hazard.lastCheckMs = now;
+  hazard.pending = true;
+  hazard.checks++;
+  try {
+    const result = await post("/api/hazard", { frames, motionDescription: currentMotionDescription() }, true, 20_000);
+    const assessment = result.assessment ?? null;
+    const utterance = result.utterance ?? null;
+    // Only a completed check may claim the view was assessed; a failed one leaves the signature
+    // behind so the same picture is looked at again instead of being written off as seen.
+    hazard.lastSignature = latest.signature ?? null;
+    hazard.dangerLive = Boolean(utterance);
+    hazard.status = assessment
+      ? `${HAZARD_SEVERITY_LABEL[assessment.severity] || assessment.severity}·${assessment.kind}（置信 ${Math.round((assessment.confidence ?? 0) * 100)}%）`
+      : "无结论";
+    if (utterance) {
+      // The endpoint only rules; the warning itself goes through the arbiter so a safety line can
+      // preempt whatever is being said, and so every preemption is recorded for the trial.
+      void arbitrate("safety", utterance.text, {
+        id: utterance.id,
+        ttlMs: utterance.ttlMs,
+        source: utterance.source || "hazard",
+        latchKey: utterance.latchKey,
+        evidence: utterance.evidence,
+        confidence: utterance.confidence,
+      });
+      setStatus($("hazard-status"), `危险检测：${utterance.text}`);
+    } else {
+      setStatus($("hazard-status"), `危险检测：前方未发现危险（${assessment?.kind ?? "none"}）`);
+    }
+  } catch (error) {
+    hazard.status = `检查失败：${error.message}`;
+    setStatus($("hazard-status"), hazard.status, true);
+  } finally {
+    hazard.pending = false;
+    updateDiagnostics();
+  }
+}
+
+/** The safety clock ticks faster than the check interval so the interval is actually honoured. */
+function startHazardWatch() {
+  if (state.hazard.timer) return;
+  state.hazard.timer = window.setInterval(() => { void maybeHazardWatch(); }, 1_000);
+}
+
+function stopHazardWatch() {
+  if (state.hazard.timer) { window.clearInterval(state.hazard.timer); state.hazard.timer = null; }
+  const hazard = state.hazard;
+  hazard.pending = false;
+  hazard.dangerLive = false;   // the camera is gone, so "the same danger is still there" cannot be assumed
+  hazard.lastSignature = null;
+  hazard.lastCheckMs = 0;
+  hazard.status = "未开始";
+}
+
 function hasFrameRelativeDirection(text) {
   const direction = "(?:左|右|上|下)(?:边|側|侧|方|角)?";
   const imageReference = "(?:图片|画面|图像|照片|截图|屏幕|image|picture|frame|screen)";
@@ -1057,6 +1163,13 @@ function renderResult(result) {
   for (const select of document.querySelectorAll("[data-feedback]")) select.value = "";
   $("feedback-notes").value = "";
   setStatus($("feedback-status"), "");
+  // Monitor results used to be display-only: nothing was ever spoken. Routing them through the
+  // arbiter means a hazard warning can outrank a routine observation, "clarify" actually gets said,
+  // and every scheduling choice is recorded instead of silently dropped.
+  if (result.decision && result.decision !== "silent" && result.response) {
+    const kind = result.policyAction === "CLARIFY" ? "clarify" : result.policyAction === "ANSWER" ? "task" : "ambient";
+    void arbitrate(kind, result.response, { source: "observe" });
+  }
   updateActionState();
 }
 
@@ -1450,7 +1563,7 @@ const SPEECH_LOW = 0;      // background narration; dropped silently if somethin
 const SPEECH_NORMAL = 1;   // status messages and replies
 const SPEECH_URGENT = 2;   // the answer to what the user is actively looking for
 
-function speak(text, priority = SPEECH_NORMAL) {
+function speak(text, priority = SPEECH_NORMAL, meta = null) {
   if (!$("speak-toggle")?.checked || !text) return;
   if (outputSpeaking) {
     if (priority >= SPEECH_NORMAL) {
@@ -1461,6 +1574,7 @@ function speak(text, priority = SPEECH_NORMAL) {
       return;   // a stale, low-priority line is worse than saying nothing at all
     }
   }
+  if (meta) recordArbiterSpoken(meta, text);
   speechChain = speechChain.then(() => speakOnce(text)).catch(() => { /* keep the chain alive */ });
 }
 
@@ -1468,7 +1582,7 @@ function speak(text, priority = SPEECH_NORMAL) {
 function speakOnce(text) {
   return new Promise((resolve) => {
     let settled = false;
-    const finish = () => { if (settled) return; settled = true; outputSpeaking = false; currentPlayback = null; speechCooldownUntil = Date.now() + 900; resolve(); };
+    const finish = () => { if (settled) return; settled = true; outputSpeaking = false; currentPlayback = null; speechCooldownUntil = Date.now() + 900; arbiterSpeaking = null; resolve(); arbiterDrainSoon(); };
     outputSpeaking = true;
     speechStartedAt = Date.now();
     if (!isAndroidDevice && typeof speechSynthesis !== "undefined") {
@@ -1586,6 +1700,87 @@ function interruptSpeech() {
   speechChain = Promise.resolve();   // discard lines that had not started yet
   setStatus($("voice-status"), "已听到你说话，正在听…");
   if (!vad.speaking) { vad.speaking = true; vad.startedAt = Date.now(); startSegment(); }
+}
+
+// --- Response arbitration: the server decides *who* may speak; this side only plays it ---
+// One voice channel is shared by three producers: safety warnings, clarification requests and the
+// answer to the user's own question. Keeping the decision on the server makes it testable and puts
+// every scheduling choice into events.jsonl for later analysis; the queue, preemption and barge-in
+// stay here because only this side knows the real playback timing.
+const ARBITER_SPEECH_PRIORITY = { safety: SPEECH_URGENT, clarify: SPEECH_NORMAL, task: SPEECH_NORMAL, ambient: SPEECH_LOW };
+const ARBITER_RANK = { safety: 0, clarify: 1, task: 2, ambient: 3 };
+const ARBITER_DEFAULT_TTL_MS = { safety: 4000, clarify: 20000, task: 15000, ambient: 30000 };
+let arbiterSpeaking = null;   // { id, kind, text } playing right now
+let arbiterRecent = [];       // recently spoken, so the server can suppress repeats and fatigue
+let arbiterPending = [];      // lines the server told us to hold back for now
+let arbiterDrainTimer = null;
+
+/**
+ * Remember a line as the one being spoken (approximate while several lines are queued).
+ *
+ * `latchKey` travels with it: the server matches a new warning against the latched danger in this
+ * history to decide whether it is a reminder of the same danger or a repeat of one already said.
+ * Dropping the key here would make every look at a persistent step look like a brand-new danger and
+ * the reminder interval would never apply.
+ */
+function recordArbiterSpoken(meta, text) {
+  const identity = { id: meta.id, kind: meta.kind, text: meta.text || text, ...(meta.latchKey ? { latchKey: meta.latchKey } : {}) };
+  arbiterSpeaking = identity;
+  arbiterRecent = [{ ...identity, atMs: Date.now() }, ...arbiterRecent].slice(0, 10);
+}
+
+/** Ask the server who should own the voice channel for this line. */
+async function arbitrate(kind, text, options = {}) {
+  if (!$("speak-toggle")?.checked || !text) return null;
+  const candidate = {
+    id: options.id || `u-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    kind,
+    text,
+    ttlMs: options.ttlMs || ARBITER_DEFAULT_TTL_MS[kind] || 15000,
+    source: options.source || kind,
+    // Safety lines carry who/what raised them: the latch key keeps a persistent danger reminding on
+    // its own interval, and the evidence ids keep the decision auditable after the fact.
+    ...(options.latchKey ? { latchKey: options.latchKey } : {}),
+    ...(options.evidence ? { evidence: options.evidence } : {}),
+    ...(options.confidence === undefined || options.confidence === null ? {} : { confidence: options.confidence }),
+  };
+  try {
+    const decision = await post("/api/arbiter", {
+      candidate,
+      pending: arbiterPending,
+      speaking: arbiterSpeaking,
+      recent: arbiterRecent,
+      nowMs: Date.now(),
+    }, true, 8000);
+    applyArbiterDecision(decision, candidate);
+    return decision;
+  } catch {
+    // Arbitration is a refinement, not a safety net: if it is unreachable we keep the old behaviour.
+    speak(text, ARBITER_SPEECH_PRIORITY[kind] ?? SPEECH_NORMAL);
+    return null;
+  }
+}
+
+function applyArbiterDecision(decision, candidate) {
+  if (!decision || typeof decision.action !== "string") return;
+  if (Array.isArray(decision.pending)) arbiterPending = decision.pending;
+  if (decision.action === "drop" || decision.action === "queue") return;   // discarded or held back by the server
+  speak(candidate.text, ARBITER_SPEECH_PRIORITY[candidate.kind] ?? SPEECH_NORMAL, candidate);
+}
+
+/** Once the channel frees up, say the most urgent line the server left waiting. */
+function arbiterDrain() {
+  if (outputSpeaking || arbiterPending.length === 0) return;
+  const sorted = [...arbiterPending].sort((a, b) => (ARBITER_RANK[a.kind] ?? 3) - (ARBITER_RANK[b.kind] ?? 3));
+  const next = sorted[0];
+  if (!next) return;
+  arbiterPending = arbiterPending.filter((item) => item.id !== next.id);
+  speak(next.text, ARBITER_SPEECH_PRIORITY[next.kind] ?? SPEECH_NORMAL, next);
+}
+
+function arbiterDrainSoon() {
+  if (arbiterDrainTimer) return;
+  arbiterDrainTimer = window.setTimeout(() => { arbiterDrainTimer = null; arbiterDrain(); }, 0);
 }
 
 async function startVoiceAssistant() {
@@ -1871,9 +2066,9 @@ function showRequestResult(result) {
   if ($("output")) $("output").textContent = `${kindLabel}：${result.answer}${frameHint}`;
   if (result.shouldSpeak && !repeated) {
     setStatus($("app-status"), `◉ ${kindLabel}：${result.answer}${frameHint}`);
-    // The answer to what the user is hunting for outranks anything we are already saying:
-    // speak it now instead of queueing behind a description that is already out of date.
-    speak(result.answer, SPEECH_URGENT);
+    // Routed through the arbiter: a hazard warning may outrank this answer, and the server records
+    // why one line preempted another instead of every producer grabbing the channel directly.
+    void arbitrate("task", result.answer, { source: "request" });
   } else setStatus($("app-status"), `${kindLabel}：${result.answer}${frameHint}${repeated ? "（与上次相同，未重复播报）" : "（未提示）"}`);
 }
 
@@ -1903,6 +2098,53 @@ $("tts-test-button")?.addEventListener("click", () => {
   setStatus($("voice-status"), "测试播报：正在合成…");
   speak("你好，语音播报测试成功，现在可以正常播报了。");
 });
+
+// --- Safety watch toggle ---
+// The real detector is the ⚠ 危险检测 switch: while it is on, a short look at the scene is sent to
+// /api/hazard on its own cadence, independent of the background observation budget. It starts off
+// because each look is a paid call and the operator decides when a run is watched.
+$("hazard-watch-toggle")?.addEventListener("change", () => {
+  const toggle = $("hazard-watch-toggle");
+  state.hazard.lastCheckMs = 0;
+  state.hazard.lastSignature = null;
+  state.hazard.skipped = 0;
+  if (!toggle.checked) {
+    state.hazard.dangerLive = false;
+    state.hazard.status = "未开启";
+    setStatus($("app-status"), "危险检测已关闭。");
+    setStatus($("hazard-status"), "未开启");
+  } else if (!state.stream) {
+    toggle.checked = false;
+    setStatus($("app-status"), "请先开启摄像头，再启动危险检测。", true);
+  } else {
+    unlockAudio();
+    $("speak-toggle").checked = true;
+    setStatus($("app-status"), "危险检测已开启：只判断危险，发现危险立即播报。");
+    void maybeHazardWatch();
+  }
+  updateActionState();
+});
+
+// --- Manual hazard injection (kept for the trial) ---
+// The real detector is noisy by design and rare in a corridor, so this injects one warning on demand.
+// It is the only way to rehearse preemption, interruption and alarm fatigue back to back; it is a
+// measurement tool, not a detector.
+$("hazard-button")?.addEventListener("click", () => {
+  unlockAudio();
+  $("speak-toggle").checked = true;
+  setStatus($("voice-status"), "已注入一条安全预警（手动）");
+  void arbitrate("safety", "小心，前方有障碍物，请停下。", { source: "manual-hazard", ttlMs: 6000, latchKey: "hazard:manual" });
+});
+
+/** Replays one scheduling scenario so preemption can be seen in a single run. */
+$("arbiter-demo-button")?.addEventListener("click", () => {
+  unlockAudio();
+  $("speak-toggle").checked = true;
+  setStatus($("voice-status"), "调度演示：先播回答，2 秒后插入危险预警，6 秒后插入澄清请求…");
+  void arbitrate("task", "你现在在走廊里，正前方有一扇灰色的门，左手边有一个梯子，右手边有一把折叠椅，继续向前大约五步就能到门口。", { source: "demo" });
+  window.setTimeout(() => void arbitrate("safety", "小心，前方有人靠近，请停下。", { source: "demo", ttlMs: 6000 }), 2000);
+  window.setTimeout(() => void arbitrate("clarify", "你说的是左手边那扇门吗？请把手机向左转一点。", { source: "demo" }), 6000);
+});
 setupVoice();
 $("goal").addEventListener("input", updateActionState);
 $("auto-observe-button").addEventListener("click", () => {
@@ -1927,5 +2169,6 @@ window.addEventListener("pagehide", () => {
   state.motion.samples = [];
   if (state.captureTimer) window.clearInterval(state.captureTimer);
   if (state.live.timer) window.clearInterval(state.live.timer);
+  if (state.hazard.timer) window.clearInterval(state.hazard.timer);
   void flushLiveBatch();
 });

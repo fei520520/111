@@ -156,7 +156,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Baseline: measure VLM self-reported confidence under injected ambiguity.")
     parser.add_argument("--dataset", required=True, type=Path, help="Directory with manifest.jsonl (from inject_ambiguity.py).")
     parser.add_argument("--out", required=True, type=Path, help="Output directory for results/report.")
-    parser.add_argument("--model", default=os.getenv("QWEN_MODEL", "qwen3-vl-plus"))
+    parser.add_argument("--model", default="qwen3-vl-plus", help="Pinned for reproducibility with the n=250 baseline; pass --model explicitly to run another model.")
     parser.add_argument("--question", default=DEFAULT_QUESTION)
     parser.add_argument("--limit", type=int, default=0, help="Max samples (0 = all).")
     args = parser.parse_args()

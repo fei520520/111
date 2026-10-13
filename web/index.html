@@ -44,13 +44,17 @@
         <div id="output" class="output" aria-live="polite">回答会显示在这里。</div>
         <div class="ask-tools">
           <label class="inline"><input type="checkbox" id="speak-toggle" checked> 🔊 语音播报</label>
+          <label class="inline" title="开启后按固定节奏单独看一次画面，只判断危险，不计入后台观察的调用预算"><input type="checkbox" id="hazard-watch-toggle"> ⚠ 危险检测</label>
           <button id="tts-test-button" class="secondary">🔊 测试播报</button>
+          <button id="hazard-button" class="secondary">⚠ 模拟危险</button>
+          <button id="arbiter-demo-button" class="secondary">调度演示</button>
           <button id="watch-button" class="secondary" disabled>关注这个情况</button>
           <button id="stop-task-button" class="secondary" disabled>结束</button>
         </div>
         <div class="scene-lines">
           <span>场景 <b id="scene-status">未开始</b></span>
           <span>变化 <b id="change-status">未开始</b></span>
+          <span>危险 <b id="hazard-status">未开始</b></span>
         </div>
         <p id="voice-status" class="muted" aria-live="polite"></p>
         <p id="task-status" class="muted" aria-live="polite"></p>
