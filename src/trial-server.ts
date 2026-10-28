@@ -13,7 +13,7 @@ import { SceneAgent } from "./agent/scene-agent.js";
 import { SceneChangeAgent } from "./agent/scene-change-agent.js";
 import { RequestAgent } from "./agent/request-agent.js";
 import { decideUtterance, fifoPolicy, safetyFirstPolicy, type SpokenRecord, type Utterance, type UtteranceKind } from "./agent/response-arbiter.js";
-import { HAZARD_PROMPT, hazardToUtterance, parseHazardReply } from "./agent/hazard-watch.js";
+import { HAZARD_MAX_FRAMES, checkHazard, type HazardFrame } from "./agent/hazard-check.js";
 
 const PORT = Number(process.env.VLM_TRIAL_PORT || "8765");
 /** LAN IPv4 captured by scripts/setup-lan-tls.ps1, used only for console hints. */
@@ -818,8 +818,6 @@ async function handleArbiter(req: IncomingMessage, res: ServerResponse, session:
 	});
 }
 
-const HAZARD_MODEL = process.env.QWEN_HAZARD_MODEL || process.env.QWEN_MODEL || "qwen3.8-flash";
-
 /**
  * Safety check for one look at the scene.
  *
@@ -827,17 +825,21 @@ const HAZARD_MODEL = process.env.QWEN_HAZARD_MODEL || process.env.QWEN_MODEL || 
  * runs at its own cadence with a prompt that only worries about danger, and it cannot be diluted by
  * whatever the general observation prompt is busy with. This endpoint only looks; the caller
  * decides what to do with the verdict.
+ *
+ * The handler is transport only: it stages the frames so a verdict can be reviewed later, then hands
+ * them to the same `checkHazard` the offline replay uses. One implementation, so a replay result is
+ * evidence about the code that actually runs on the phone.
  */
 async function handleHazard(req: IncomingMessage, res: ServerResponse, session: { id: string }): Promise<void> {
 	const input = await bodyJson(req);
-	if (!Array.isArray(input.frames) || input.frames.length < 1 || input.frames.length > 3) throw new Error("hazard 需要 1 到 3 张截图");
-	const motionDescription = typeof input.motionDescription === "string" ? input.motionDescription.slice(0, 600) : "";
+	const rows = Array.isArray(input.frames) ? input.frames : [];
+	if (rows.length < 1 || rows.length > HAZARD_MAX_FRAMES) throw new Error(`hazard 需要 1 到 ${HAZARD_MAX_FRAMES} 张截图`);
+	const motionDescription = typeof input.motionDescription === "string" ? input.motionDescription.slice(0, 600) : null;
 	const runId = randomUUID();
 	const stagingDir = resolve("run/mobile-staging", session.id, `hazard-${runId}`);
 	await mkdir(stagingDir, { recursive: true });
-	const content: Array<Record<string, unknown>> = [{ type: "text", text: motionDescription ? `${HAZARD_PROMPT}\n\n用户此刻的运动状态：${motionDescription}` : HAZARD_PROMPT }];
-	const frameIds: string[] = [];
-	for (const [index, item] of input.frames.entries()) {
+	const frames: HazardFrame[] = [];
+	for (const [index, item] of rows.entries()) {
 		if (typeof item !== "object" || item === null || Array.isArray(item)) throw new Error(`截图 ${index + 1} 格式错误`);
 		const row = item as Record<string, unknown>;
 		if (typeof row.dataBase64 !== "string" || typeof row.timestampMs !== "number") throw new Error(`截图 ${index + 1} 缺少图像或时间戳`);
@@ -847,26 +849,14 @@ async function handleHazard(req: IncomingMessage, res: ServerResponse, session: 
 		const bytes = Buffer.from(row.dataBase64, "base64");
 		if (bytes.length === 0 || bytes.length > MAX_IMAGE_BYTES) throw new Error("每张截图最大为 1.5 MB");
 		await writeFile(resolve(stagingDir, `frame-${String(index + 1).padStart(2, "0")}${extension}`), bytes);
-		frameIds.push(`hazard-${index + 1}-${Math.round(row.timestampMs)}`);
-		content.push({ type: "image_url", image_url: { url: `data:${String(mime)};base64,${row.dataBase64}` } });
+		frames.push({ timestampMs: Math.round(row.timestampMs), mimeType: String(mime), dataBase64: row.dataBase64 });
 	}
-	const baseUrl = process.env.QWEN_BASE_URL!.replace(/\/+$/, "");
-	const started = Date.now();
-	const response = await fetch(`${baseUrl}/chat/completions`, {
-		method: "POST",
-		headers: { "Content-Type": "application/json", Authorization: `Bearer ${process.env.QWEN_API_KEY}` },
-		body: JSON.stringify({ model: HAZARD_MODEL, messages: [{ role: "user", content }], temperature: 0, max_tokens: 300 }),
-	});
-	const result = await response.json().catch(() => ({})) as { choices?: Array<{ message?: { content?: string } }>; error?: { message?: string } };
-	if (!response.ok) throw new Error(result?.error?.message || `危险检测请求失败 (${response.status})`);
-	const raw = result.choices?.[0]?.message?.content ?? "";
-	const assessment = parseHazardReply(raw, frameIds);
-	const utterance = hazardToUtterance(assessment, Date.now());
+	const result = await checkHazard(frames, motionDescription);
 	await appendSessionEvent(experimentRoot, session.id, {
 		type: "hazard_assessed",
-		details: { ...assessment, model: HAZARD_MODEL, elapsedMs: Date.now() - started, raw: raw.slice(0, 400) },
+		details: { ...result.assessment, model: result.model, elapsedMs: result.elapsedMs, raw: result.raw.slice(0, 400) },
 	});
-	json(res, 200, { assessment, utterance });
+	json(res, 200, { assessment: result.assessment, utterance: result.utterance });
 }
 
 function parseMotionCalibration(value: unknown): MotionCalibration | undefined {

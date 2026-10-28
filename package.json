@@ -20,6 +20,8 @@
     "sim:experience": "npm run build && node dist/sim/experience-revisable-eval.js",
     "sim:regions": "npm run build && node dist/sim/region-partition-eval.js",
     "sim:regions:stress": "npm run build && node dist/sim/region-partition-stress.js",
+    "test:hazard": "npm run build && node --test dist/agent/hazard-watch.test.js dist/agent/response-arbiter.test.js dist/agent/hazard-check.test.js dist/agent/hazard-replay.test.js",
+    "sim:hazard:replay": "npm run build && node dist/sim/hazard-replay.js",
     "build": "tsc --noEmit false --outDir dist",
     "harness:sample": "npm run build && node --use-env-proxy dist/run-sample.js",
     "harness:cases": "npm run build && node --use-env-proxy dist/run-cases.js",
