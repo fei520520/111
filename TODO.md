@@ -11,6 +11,37 @@
 - [ ] 真机一次连续行走的漏报检查：需要 `QWEN_API_KEY`，按 `--limit` 控制付费调用次数；重点看漏报（标为危险却判定安全），不是误报。
 - 思路来源注明：用历史帧离线回放整条链路的想法参考了 F010110/first-sight 的做法，本线为独立实现（未复制其代码、未引入其模块）。
 
+## 语音连续对话与"不说话"排查（2026-10-28，未闭环）
+
+目标：像打语音电话一样连续对话，用户一开口就打断播报。
+
+**已确认的根因（服务端，已修）**：qwen3-tts 返回流式 WAV，头部 RIFF/data 长度是占位值。实测一段 65,324 字节的音频，头部声明 RIFF 2,147,483,583、data 2,147,483,547（约 2 GB）。浏览器的 `decodeAudioData` 相信声明长度 → 解码失败 → 手机完全无声，而服务端一路 200，从电脑上测完全正常。`src/trial-server.ts` 新增 `repairWavSizes()` 重写这两个字段，修复后实测 RIFF=65,316、data=65,280，与文件长度一致。**未验证**：修好后手机是否真的出声（当天没来得及试）。
+
+**已改但未验证的客户端项**（`web/app.js`）：
+
+- 打断计时改到音频真正开始（`beginPlayback()`）：此前把"排队等 /api/tts"的时间算作播放时间，导致回声基线测成静音、一出声就自我打断。
+- `AudioContext` 处于 `suspended` 时先 `resume()`，仍不可用则退回 `<audio>` 元素，避免"挂起的上下文永不触发 ended"。
+- 每句 20 秒看门狗：任何一句卡住都会让后续全部排队，这是"整条播报链永久哑掉"的机制。
+- `vadTick` 不再被 `state.busy` 冻结：请求期间也听，打断时开的录音段不会被丢弃。
+- 打断阈值自适应（按每句实测回声基线 ×1.6，上限 0.30），不再用固定 0.10：荣耀外放响会自打断、外放轻则永不闭嘴。
+- 转写串行队列 + 15 秒过期丢弃；录音器启动失败可自愈（此前一次失败会永久锁死 `vad.speaking`）。
+- 句末静音 1.4s→1.0s，播报后冷却 900ms→450ms。
+- 安全预警（`safety`）**不被**打断：截断"停下，前面有台…"本身就是伤害；其余播报一律让位。
+
+**观测设施（本次新增，可长期用）**：
+
+- `run/voice-log.jsonl`：每次 TTS 合成记录 `ok / bytes / headerRepaired / error`。
+- `run/client-log.jsonl` + `/api/client-log` + 客户端 `clientLog()`：记录 `answer(shouldSpeak,repeated)`、`speak_skip(原因)`、`speak_queue`、`speak_start`、`arbiter_call/decision/held/error`、`tts_ok/error`。
+- 页面新增 **🔍 语音自检** 按钮与 `#voice-check` 输出：构建号、开关、`AudioContext` 状态、`/api/tts` 耗时与字节数、`outputSpeaking` 前后变化。
+
+**未闭环的关键证据**：2026-10-28 15:56:38 那次回答（"哈喽。…"，`events.jsonl` 里 `shouldSpeak=true`）**没有**对应的 `/api/tts`，也**没有**任何 `/api/arbiter` 请求，只有更早的两条短句合成过。即"该说话"那一步在客户端被掐断，原因未知——`run/client-log.jsonl` 就是为抓这一步加的，尚未收集到数据。
+
+**明天的第一步**：刷新页面 → 重新输口令（服务重启会使内存中的会话失效）→ 说一句 → 读 `run/client-log.jsonl`，看是 `speak_skip`（开关）、`arbiter_*`（仲裁）、还是 `tts_error`（合成/播放）。
+
+**运行状态**：试用服务以隐藏进程运行（`node dist/trial-server.js`，口令 `zpf`，监听 8765/8767）。改了服务端代码必须重新 `npm run build` 并重启；只改 `web/` 刷新页面即可。手动重启：`$env:VLM_TRIAL_PASSCODE="zpf"; npm.cmd run trial:web`。
+
+**提交状态**：`src/trial-server.ts`、`web/app.js`、`web/index.html` 三处改动尚未提交。
+
 ## 当前方向与限制
 
 **阶段性结论：空间记忆算法已初步可用（离线研究链路）**。主体区域与边界聚合协议已固定，保留未知与原始证据，可开始扩大测试和精确人工标注。val4粗粒度核心44/44但边界4/13，val5待审；长期历史区域身份匹配、真实头盔与实时生产可靠性尚未验证，不能把开发集结果当验收通过。当前版本先提交/push，扩大测试与精确标注作为下一阶段。

@@ -199,29 +199,92 @@ async function handleAsr(req: IncomingMessage, res: ServerResponse): Promise<voi
 const TTS_MODEL = process.env.QWEN_TTS_MODEL || "qwen3-tts-flash";
 const TTS_VOICE = process.env.QWEN_TTS_VOICE || "Cherry";
 
-async function handleTts(req: IncomingMessage, res: ServerResponse): Promise<void> {
+/** Append-only voice log: a silent phone otherwise looks identical to a phone that never spoke. */
+async function logVoice(entry: Record<string, unknown>): Promise<void> {
+	try {
+		await mkdir(resolve("run"), { recursive: true });
+		await appendFile(resolve("run/voice-log.jsonl"), `${JSON.stringify({ at: new Date().toISOString(), ...entry })}\n`, "utf8");
+	} catch { /* logging must never break speech */ }
+}
+
+/**
+ * Client-side speech decisions.
+ *
+ * A silent phone is otherwise unobservable: "the answer did not speak" could be a disabled toggle, a
+ * dropped arbitration request or a decode failure, and from the server all three look like nothing at
+ * all. The phone posts what it decided, so the reason can be read here instead of guessed at.
+ */
+async function handleClientLog(req: IncomingMessage, res: ServerResponse): Promise<void> {
 	const input = await bodyJson(req);
-	const text = input.text;
-	if (typeof text !== "string" || !text.trim()) throw new Error("缺少要合成的文本");
-	if (text.length > 600) throw new Error("文本过长（最多 600 字）");
-	const origin = new URL(process.env.QWEN_BASE_URL!).origin;
-	const endpoint = `${origin}/api/v1/services/aigc/multimodal-generation/generation`;
-	const response = await fetch(endpoint, {
-		method: "POST",
-		headers: { "Content-Type": "application/json", Authorization: `Bearer ${process.env.QWEN_API_KEY}` },
-		body: JSON.stringify({ model: TTS_MODEL, input: { text, voice: TTS_VOICE, language_type: "Chinese" } }),
-	});
-	const result = await response.json().catch(() => ({})) as { output?: { audio?: { data?: string; url?: string } }; message?: string };
-	const audio = result.output?.audio;
-	if (!response.ok || !audio) throw new Error(result?.message || `语音合成失败 (${response.status})`);
-	let base64 = audio.data ?? "";
-	if (!base64 && audio.url) {
-		const audioResponse = await fetch(audio.url);
-		if (!audioResponse.ok) throw new Error("下载合成音频失败");
-		base64 = Buffer.from(await audioResponse.arrayBuffer()).toString("base64");
+	const event = typeof input.event === "string" ? input.event.slice(0, 60) : "unknown";
+	const details = input.details && typeof input.details === "object" && !Array.isArray(input.details) ? input.details : {};
+	try {
+		await mkdir(resolve("run"), { recursive: true });
+		await appendFile(resolve("run/client-log.jsonl"), `${JSON.stringify({ at: new Date().toISOString(), event, details }).slice(0, 2000)}\n`, "utf8");
+	} catch { /* logging must never break the page */ }
+	json(res, 200, { ok: true });
+}
+
+/**
+ * Repair the streaming WAV header before it reaches a browser.
+ *
+ * The TTS service returns a WAV whose RIFF and data sizes are placeholders (~2 GB) because the audio
+ * was produced as a stream. Desktop players work around it, but a browser's decodeAudioData trusts
+ * the declared size, so the clip fails to decode and the phone stays silent while the server reports
+ * success. Rewriting the two fields with the real byte counts costs nothing and removes a whole class
+ * of "audio arrived but plays nothing".
+ */
+function repairWavSizes(input: Buffer): { bytes: Buffer; repaired: boolean } {
+	if (input.length < 44) return { bytes: input, repaired: false };
+	if (input.toString("ascii", 0, 4) !== "RIFF" || input.toString("ascii", 8, 12) !== "WAVE") return { bytes: input, repaired: false };
+	let offset = 12;
+	while (offset + 8 <= input.length) {
+		const id = input.toString("ascii", offset, offset + 4);
+		const size = input.readUInt32LE(offset + 4);
+		if (id === "data") {
+			const actual = input.length - offset - 8;
+			const riffSize = input.length - 8;
+			if (size === actual && input.readUInt32LE(4) === riffSize) return { bytes: input, repaired: false };
+			const bytes = Buffer.from(input);
+			bytes.writeUInt32LE(actual, offset + 4);
+			bytes.writeUInt32LE(riffSize, 4);
+			return { bytes, repaired: true };
+		}
+		offset += 8 + size + (size % 2);
 	}
-	if (!base64) throw new Error("语音合成未返回音频");
-	json(res, 200, { audioBase64: base64, mimeType: "audio/wav" });
+	return { bytes: input, repaired: false };
+}
+
+async function handleTts(req: IncomingMessage, res: ServerResponse): Promise<void> {
+	try {
+		const input = await bodyJson(req);
+		const text = input.text;
+		if (typeof text !== "string" || !text.trim()) throw new Error("缺少要合成的文本");
+		if (text.length > 600) throw new Error("文本过长（最多 600 字）");
+		const origin = new URL(process.env.QWEN_BASE_URL!).origin;
+		const endpoint = `${origin}/api/v1/services/aigc/multimodal-generation/generation`;
+		const response = await fetch(endpoint, {
+			method: "POST",
+			headers: { "Content-Type": "application/json", Authorization: `Bearer ${process.env.QWEN_API_KEY}` },
+			body: JSON.stringify({ model: TTS_MODEL, input: { text, voice: TTS_VOICE, language_type: "Chinese" } }),
+		});
+		const result = await response.json().catch(() => ({})) as { output?: { audio?: { data?: string; url?: string } }; message?: string };
+		const audio = result.output?.audio;
+		if (!response.ok || !audio) throw new Error(result?.message || `语音合成失败 (${response.status})`);
+		let base64 = audio.data ?? "";
+		if (!base64 && audio.url) {
+			const audioResponse = await fetch(audio.url);
+			if (!audioResponse.ok) throw new Error("下载合成音频失败");
+			base64 = Buffer.from(await audioResponse.arrayBuffer()).toString("base64");
+		}
+		if (!base64) throw new Error("语音合成未返回音频");
+		const repaired = repairWavSizes(Buffer.from(base64, "base64"));
+		await logVoice({ kind: "tts", ok: true, textLength: text.length, bytes: repaired.bytes.length, headerRepaired: repaired.repaired });
+		json(res, 200, { audioBase64: repaired.bytes.toString("base64"), mimeType: "audio/wav" });
+	} catch (error) {
+		await logVoice({ kind: "tts", ok: false, error: error instanceof Error ? error.message : String(error) });
+		throw error;
+	}
 }
 
 async function handleObserve(req: IncomingMessage, res: ServerResponse, session: { id: string; requests: number[] }): Promise<void> {
@@ -1194,6 +1257,7 @@ async function main(): Promise<void> {
 				await handleTts(req, res);
 				return;
 			}
+			if (pathname === "/api/client-log") { await handleClientLog(req, res); return; }
 			if (pathname === "/api/task") { await handleTask(req, res, session.id); return; }
 			if (pathname === "/api/watch") { await handleWatch(req, res, session.id); return; }
 			if (pathname === "/api/feedback") { await handleFeedback(req, res, session); return; }
