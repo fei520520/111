@@ -44,9 +44,24 @@ test("idle channel speaks immediately and prunes expired waiting utterances", ()
 	assert.equal(decision.nextState.pending.length, 0);
 });
 
-test("alarm fatigue: the same kind cannot speak twice inside its cooldown", () => {
-	const state = markSpoken(createArbiterState(), u("s1", "safety", { atMs: 0 }), 0);
-	const decision = decideUtterance(u("s2", "safety", { atMs: 500 }), state, 500);
+test("alarm fatigue: a non-safety kind cannot speak twice inside its cooldown", () => {
+	const state = markSpoken(createArbiterState(), u("t1", "task", { atMs: 0 }), 0);
+	const decision = decideUtterance(u("t2", "task", { atMs: 500 }), state, 500);
+	assert.equal(decision.action, "drop");
+	assert.equal(decision.reason, "cooldown-or-duplicate");
+});
+
+test("a second, different hazard is not silenced by the kind cooldown", () => {
+	// This used to be dropped as a repeat because both lines were safety, which meant the user never
+	// heard about the second obstacle. Suppression must depend on the wording, not on the kind.
+	const state = markSpoken(createArbiterState(), u("s1", "safety", { atMs: 0, text: "小心，前面有台阶" }), 0);
+	const decision = decideUtterance(u("s2", "safety", { atMs: 500, text: "小心，右边有人" }), state, 500);
+	assert.notEqual(decision.action, "drop");
+});
+
+test("the same hazard wording is still suppressed inside the duplicate window", () => {
+	const state = markSpoken(createArbiterState(), u("s1", "safety", { atMs: 0, text: "小心，前面有台阶" }), 0);
+	const decision = decideUtterance(u("s2", "safety", { atMs: 500, text: "小心，前面有台阶" }), state, 500);
 	assert.equal(decision.action, "drop");
 	assert.equal(decision.reason, "cooldown-or-duplicate");
 });

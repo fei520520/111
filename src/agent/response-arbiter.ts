@@ -112,33 +112,56 @@ export const DEFAULT_LIMITS: ArbiterLimits = { maxPending: 6, recentWindowMs: 30
 /** How often the same persistent danger may be repeated while it is still there. */
 export const HAZARD_REMINDER_MS = 3000;
 
+export interface SafetyFirstOptions {
+	/**
+	 * Whether the generic per-kind cooldown also applies to safety lines.
+	 *
+	 * Off (the default, since 2026-10-29): two *different* hazards arriving within 1.5s of each other
+	 * both speak. Leaving the cooldown on discarded the second one as a repeat even though its text
+	 * differed — measured on 27 workload cells, that swallowed up to 4.9% of hazard warnings while
+	 * saving 0.33 interruptions per 288 answers. Duplicate control for hazards comes from the
+	 * same-text window below and from `latchKey` reminders, not from a blanket silence on the kind.
+	 *
+	 * On: the pre-2026-10-29 behaviour, kept so the ablation stays measurable.
+	 */
+	safetyKindCooldown?: boolean;
+	/** Name used in reports and logs. Defaults to "safety-first". */
+	name?: string;
+}
+
 /** Default schedule: a more urgent kind may interrupt a less urgent one. */
-export const safetyFirstPolicy: ArbiterPolicy = {
-	name: "safety-first",
-	shouldPreempt: (candidate, speaking) => PREEMPTIVE[candidate.kind] && PRIORITY[candidate.kind] < PRIORITY[speaking.utterance.kind],
-	repeatAllowed: (candidate, recent, nowMs, limits) => {
-		// A keyed danger is throttled by its own reminder interval instead of the generic cooldown:
-		// silence while the user keeps walking toward the same step is exactly what must not happen.
-		if (candidate.latchKey) {
-			let newest = -1;
-			for (const record of recent) {
-				if (record.utterance.latchKey !== candidate.latchKey) continue;
-				if (nowMs - record.atMs >= limits.recentWindowMs) continue;
-				if (record.atMs > newest) newest = record.atMs;
+export function createSafetyFirstPolicy(options: SafetyFirstOptions = {}): ArbiterPolicy {
+	const safetyKindCooldown = options.safetyKindCooldown ?? false;
+	return {
+		name: options.name ?? "safety-first",
+		shouldPreempt: (candidate, speaking) => PREEMPTIVE[candidate.kind] && PRIORITY[candidate.kind] < PRIORITY[speaking.utterance.kind],
+		repeatAllowed: (candidate, recent, nowMs, limits) => {
+			// A keyed danger is throttled by its own reminder interval instead of the generic cooldown:
+			// silence while the user keeps walking toward the same step is exactly what must not happen.
+			if (candidate.latchKey) {
+				let newest = -1;
+				for (const record of recent) {
+					if (record.utterance.latchKey !== candidate.latchKey) continue;
+					if (nowMs - record.atMs >= limits.recentWindowMs) continue;
+					if (record.atMs > newest) newest = record.atMs;
+				}
+				if (newest >= 0) return nowMs - newest >= HAZARD_REMINDER_MS;
 			}
-			if (newest >= 0) return nowMs - newest >= HAZARD_REMINDER_MS;
-		}
-		const cooldown = COOLDOWN_MS[candidate.kind];
-		const text = candidate.text.trim();
-		for (const record of recent) {
-			const age = nowMs - record.atMs;
-			if (age >= limits.recentWindowMs) continue;
-			if (record.utterance.kind === candidate.kind && age < cooldown) return false;
-			if (age < limits.duplicateTextWindowMs && record.utterance.text.trim() === text) return false;
-		}
-		return true;
-	},
-};
+			const cooldown = COOLDOWN_MS[candidate.kind];
+			const kindCooldownApplies = safetyKindCooldown || candidate.kind !== "safety";
+			const text = candidate.text.trim();
+			for (const record of recent) {
+				const age = nowMs - record.atMs;
+				if (age >= limits.recentWindowMs) continue;
+				if (kindCooldownApplies && record.utterance.kind === candidate.kind && age < cooldown) return false;
+				if (age < limits.duplicateTextWindowMs && record.utterance.text.trim() === text) return false;
+			}
+			return true;
+		},
+	};
+}
+
+export const safetyFirstPolicy: ArbiterPolicy = createSafetyFirstPolicy();
 
 /** Baseline that never interrupts and never suppresses repeats; only for comparison runs. */
 export const fifoPolicy: ArbiterPolicy = {

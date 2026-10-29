@@ -1,5 +1,5 @@
 {
-  "name": "first-sight",
+  "name": "warnfirst",
   "version": "1.1.0-test.4",
   "private": true,
   "type": "module",
@@ -22,6 +22,8 @@
     "sim:regions:stress": "npm run build && node dist/sim/region-partition-stress.js",
     "test:hazard": "npm run build && node --test dist/agent/hazard-watch.test.js dist/agent/response-arbiter.test.js dist/agent/hazard-check.test.js dist/agent/hazard-replay.test.js",
     "sim:hazard:replay": "npm run build && node dist/sim/hazard-replay.js",
+    "sim:arbiter": "npm run build && node dist/sim/arbiter-compare.js",
+    "sim:arbiter:sweep": "npm run build && node dist/sim/arbiter-sweep.js",
     "build": "tsc --noEmit false --outDir dist",
     "harness:sample": "npm run build && node --use-env-proxy dist/run-sample.js",
     "harness:cases": "npm run build && node --use-env-proxy dist/run-cases.js",
