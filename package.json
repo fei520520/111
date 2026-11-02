@@ -7,19 +7,7 @@
     "node": ">=20"
   },
   "scripts": {
-    "test:research-snapshot": "python sim/test_research_snapshot.py",
-    "test:helmet-capture": "npm run build && node --test dist/agent/helmet-capture.test.js",
-    "test:grouping-benchmark": "python sim/test_grouping_benchmark.py",
-    "test:classification-standard": "python sim/test_temporal_classification_standard.py",
-    "test:retrospective-repair": "npm run build && node --test dist/agent/retrospective-group-repair.test.js",
-    "test:visual-pipeline": "npm run build && node --test dist/agent/coherent-context-changes.test.js dist/agent/current-experience-grouping.test.js dist/agent/grouping-evaluation.test.js dist/agent/visual-experience-pipeline.test.js dist/agent/visual-experience-memory.test.js dist/agent/visual-change-boundaries.test.js dist/agent/region-interpretation.test.js dist/agent/revisable-region-hierarchy.test.js dist/agent/temporal-region-continuity.test.js dist/agent/rotation-compensated-motion.test.js dist/agent/device-camera-orientation.test.js dist/agent/segment-interpretation-store.test.js dist/agent/segment-association.test.js",
-    "sim:visual:pipeline": "npm run build && node dist/sim/visual-experience-replay.js",
-    "sim:visual:scorecard": "npm run build && node dist/sim/visual-pipeline-scorecard.js",
-    "test:memory": "npm run build && node --test dist/agent/place-memory.test.js dist/agent/scene-agent.test.js dist/agent/place-candidates.test.js dist/agent/topological-filter.test.js dist/agent/topological-grouping.test.js dist/agent/experience-graph.test.js dist/agent/experience-association.test.js dist/agent/experience-grouping.test.js dist/agent/region-partition.test.js dist/agent/region-evaluation.test.js dist/agent/region-core-evaluation.test.js dist/agent/place-benchmark.test.js dist/agent/experience-segments.test.js dist/agent/orientation-evidence.test.js dist/agent/segment-association.test.js dist/agent/region-event-evaluation.test.js dist/agent/region-online-evaluation.test.js dist/agent/region-partition-metrics.test.js",
-    "sim:regions:score": "npm run build && node dist/sim/region-score.js",
-    "sim:experience": "npm run build && node dist/sim/experience-revisable-eval.js",
-    "sim:regions": "npm run build && node dist/sim/region-partition-eval.js",
-    "sim:regions:stress": "npm run build && node dist/sim/region-partition-stress.js",
+    "test:place": "npm run build && node --test dist/agent/place-memory.test.js dist/agent/place-candidates.test.js dist/agent/scene-agent.test.js",
     "test:hazard": "npm run build && node --test dist/agent/hazard-watch.test.js dist/agent/response-arbiter.test.js dist/agent/hazard-check.test.js dist/agent/hazard-replay.test.js",
     "sim:hazard:replay": "npm run build && node dist/sim/hazard-replay.js",
     "sim:arbiter": "npm run build && node dist/sim/arbiter-compare.js",
@@ -34,7 +22,6 @@
     "motion:replay": "npm run build && node dist/motion-replay.js",
     "motion:plot": "npm run build && node dist/plot-trajectory.js",
     "vio:plot": "npm run build && node dist/plot-vio.js",
-    "sim:eval": "npm run build && node dist/sim/replay-eval.js",
     "motion:import": "npm run build && node dist/import-local-recording.js",
     "typecheck": "tsc --noEmit"
   },

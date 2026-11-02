@@ -7,7 +7,7 @@ import { PlaceMemory } from "./place-memory.js";
 import { parseMotionHint } from "./motion-hint.js";
 
 test("layered memory preserves evidence through grouping, merging, rebinding and reload", async () => {
-	const file = join(await mkdtemp(join(tmpdir(), "first-sight-memory-")), "memory.json");
+	const file = join(await mkdtemp(join(tmpdir(), "warnfirst-memory-")), "memory.json");
 	const memory = new PlaceMemory(file);
 	const hint = parseMotionHint(null);
 	const a = memory.ensureScene(null, "sofa", "", [], 1);
@@ -59,7 +59,7 @@ test("split inside a visit is reversible and later observations block destructiv
 });
 
 test("V1 migration preserves visits and never invents VLM provenance; corrupt files fail", async () => {
-	const file = join(await mkdtemp(join(tmpdir(), "first-sight-migration-")), "memory.json");
+	const file = join(await mkdtemp(join(tmpdir(), "warnfirst-migration-")), "memory.json");
 	const original = new PlaceMemory(file);
 	const place = original.ensureScene(null, "old place", "", [], 1);
 	await original.onSceneResolved(place.id, "f", parseMotionHint(null), null, 1);
